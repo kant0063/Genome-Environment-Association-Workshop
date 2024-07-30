@@ -1,0 +1,5 @@
+Indetify database from where you will get geolocation data
+  - Custom Collection
+  - Germplasm Collection (e.g. GRIN-GLOBAL, Genesys)
+  - Biogeographic Collection (e.g. GBIF)
+  - Herbarium Collection (e.g. Bishop Museum, NY Botanical Garden)
