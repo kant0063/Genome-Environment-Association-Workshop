@@ -1,7 +1,7 @@
 # EAA_workshop
 This is a series of scripts to conduct an Environmental Association Analysis
-1) Accessing climate and soil data 
-2) Mapping accessions in a germplasm database 
+1) Getting acession geolocation information and mapping Mapping accession location
+2) Accessing climate and soil data 
 3) Cleaning genomic data
 4) Analysing population structure
 5) Performing the EAA
