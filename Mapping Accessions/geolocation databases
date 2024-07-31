@@ -1,5 +1,12 @@
-Indetify database from where you will get geolocation data
-  - Custom Collection
-  - Germplasm Collection (e.g. GRIN-GLOBAL, Genesys)
-  - Biogeographic Collection (e.g. GBIF)
-  - Herbarium Collection (e.g. Bishop Museum, NY Botanical Garden)
+Identify database from where you will get geolocation data
+-Custom Collection
+This type of collection is new. It is developed for the specific set of experiments/analysis that are being done for the project.
+
+
+- Germplasm Collection (e.g. GRIN-GLOBAL, Genesys)
+
+
+- Biogeographic Collection (e.g. GBIF)
+
+
+- Herbarium Collection (e.g. Bishop Museum, NY Botanical Garden)
