@@ -1,5 +1,5 @@
-#In order to explore your data the first step will be to plot the accessions
-#To do this there are a few things that are needed
+# In order to explore your data the first step will be to plot the accessions
+## To do this there are a few things that are needed
 1. Indetify database from where you will get geolocation data
   - Custom Collection
   - Germplasm Collection (e.g. GRIN-GLOBAL, Genesys)
@@ -12,7 +12,7 @@
   - Multiple definitions
       - Arbitraty point in time (e.g. 1970, 1946, 1900)
       - Best definition from Khoury et al., 2022 
-"A crop variety or population managed by farmers through cultivation, selection and diffusion, which is typically adapted to a local area and to traditional farming systems, has a recognizable identity and geographic origin, and is often genetically heterogeneous"
+*"A crop variety or population managed by farmers through cultivation, selection and diffusion, which is typically adapted to a local area and to traditional farming systems, has a recognizable identity and geographic origin, and is often genetically heterogeneous"*
 7. Clean data
   - remove all duplicates (e.g. same accession identifier)
   - remove data that do not have a latitute and longitude
