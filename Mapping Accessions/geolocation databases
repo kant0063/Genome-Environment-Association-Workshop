@@ -3,9 +3,8 @@ Identify database from where you will get geolocation data
 This type of collection is new. It is developed for the specific set of experiments/analysis that are being done for the project.
 
 
-- Germplasm Collection (e.g. GRIN-GLOBAL, Genesys)
-Globally there are many germplasm collections. One of the largest is the USDA NPGS (United States Department of Agriculture National Plant Germplasm System). Many of the CGIAR (Consultative Group for International Agricultural Research)
-
+- Germplasm Collection (e.g. GRIN-GLOBAL, Genesys-PGR)
+Globally there are many germplasm collections. One of the largest is the USDA NPGS (United States Department of Agriculture National Plant Germplasm System). Many of the CGIAR (Consultative Group for International Agricultural Research). The NPGS online system has over 600,000 accessions that can be ordered for reseearch, the online portal is known as GRIN-GLOBAL (https://www.grin-global.org/). Another database of accessions is the Genesys (a platform developed by the FAO, Bioversity International, and the Secretatirat of the International Treaty on Plant Genetic Resources, and the Crop Trust) which is an online platform that contains information about Plant Genetic Resources for Food and Agriculture -https://www.grin-global.org/.
 
 - Biogeographic Collection (e.g. GBIF)
 
