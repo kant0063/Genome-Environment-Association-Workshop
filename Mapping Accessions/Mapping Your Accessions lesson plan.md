@@ -1,10 +1,10 @@
 # In order to explore your data the first step will be to plot the accessions
 ## To do this there are a few things that are needed
-1. Indetify database from where you will get geolocation data
-  - Custom Collection
-  - Germplasm Collection (e.g. GRIN-GLOBAL, Genesys)
-  - Biogeographic Collection (e.g. GBIF)
-  - Herbarium Collection (e.g. Bishop Museum, NY Botanical Garden)
+1. Indentify database from where you will get geolocation data
+    - Custom Collection
+    - Germplasm Collection (e.g. GRIN-GLOBAL, Genesys)
+    - Biogeographic Collection (e.g. GBIF)
+    - Herbarium Collection (e.g. Bishop Museum, NY Botanical Garden)
 2. Idenitfy your species of interest
 3. Download all of the data associated with the species 
 5. Identify wild accessions
