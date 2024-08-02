@@ -1,4 +1,4 @@
-# EAA_workshop
+# Genome Enviroment Association Workshop
 This is a series of lessons accompanied by scripts to conduct an Genome Environmental Association Analysis and Genomic Environmental Selection Analysis
 1) Getting accession geolocation information and mapping Mapping accession location
 2) Accessing climate and soil data 
