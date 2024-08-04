@@ -5,5 +5,6 @@ This is a series of lessons accompanied by scripts to conduct an Genome Environm
 3) Cleaning genomic data
 4) Analysing population structure
 5) Calculating LD decay
-6) Performing the EAA & EAA Model Checking
+6) Performing the EAA (Environmental Association Analysis) & EAA (Environmental Association Analysis) Model Checking
 7) Identifying candidate genome regions and genes in LD with those regions
+8) Perfomring the EGS (Environmental Genomic Selection)
