@@ -11,8 +11,9 @@
 6. Identify landrace accessions
       - Multiple definitions
           - Arbitraty point in time (e.g. 1970, 1946, 1900)
-          - Best definition from Khoury et al., 2022 
-*"A crop variety or population managed by farmers through cultivation, selection and diffusion, which is typically adapted to a local area and to traditional farming systems, has a recognizable identity and geographic origin, and is often genetically heterogeneous"*
+          - Best definition from Khoury et al., 2022
+          -  *"A crop variety or population managed by farmers through cultivation, selection and diffusion, which is typically adapted to a local area and to traditional farming systems, has a recognizable identity and geographic origin, and is often genetically heterogeneous"*
+          -  Khoury, C. K., Brush, S., Costich, D. E., Curry, H. A., De Haan, S., Engels, J. M., et al. (2022). Crop genetic erosion: understanding and responding to loss of crop diversity. New Phytologist, 233(1), 84-118.
 7. Clean data
       - remove all duplicates (e.g. same accession identifier)
       - remove data that do not have a latitute and longitude
