@@ -3,11 +3,17 @@
 There are various data types that are commonly used for genomic analysis. The final format of the data will usually be .vcf or .hmp or .fam/.bim/.bed or .txt, these data require different levels of quality assurance and quality control. These data are also usually associated with different genotyping methods and different types of collections. 
 
 # Common types of Genotyping
+
 (1) Whole Genome shotgun sequencing
+
 (2) Genotype-by-Seqeuncing or RAD-Sequencing
+
 (3) DNA microarray (SNP-chip)
+
 (4) Amplicon sequencing
+
 (5) Sequence Capture array
+
 (6) Copmarative Gneomic Hybridization (CGH) Array
 
 # Data Cleaning pipeline
