@@ -11,17 +11,17 @@
   - Jombart, T., Devillard, S., & Balloux, F. (2010). Discriminant analysis of principal components: a new method for the analysis of genetically structured populations. BMC genetics, 11, 1-15.
 
 (3) Admixture Analysis
-  -Identification of when in time populations may have mixed, and understanding the proportion of mixing between different populations. 
-  -Peter, B. M. (2016). Admixture, population structure, and F-statistics. Genetics, 202(4), 1485-1501.
+  - Identification of when in time populations may have mixed, and understanding the proportion of mixing between different populations. 
+  - Peter, B. M. (2016). Admixture, population structure, and F-statistics. Genetics, 202(4), 1485-1501.
   -Bradburd, G. S., Ralph, P. L., & Coop, G. M. (2016). A spatial framework for understanding population structure and admixture. PLoS genetics, 12(1), e1005703.
 
 (4) Structure Analysis
-  -This method is based on K-means clustering and has been very popular for identifying admixture in different populations.
-  -Pritchard JK, Stephens M, Donnelly P. Inference of Population Structure Using Multilocus Genotype Data. Genetics. 2000 Jun;155(2):945–959. pmid:10835412
+  - This method is based on K-means clustering and has been very popular for identifying admixture in different populations.
+  - Pritchard JK, Stephens M, Donnelly P. Inference of Population Structure Using Multilocus Genotype Data. Genetics. 2000 Jun;155(2):945–959. pmid:10835412
 
 (5) Pedigree based Kinship Matrix
-  -Coancestry (kinship) was classically estimated by pedigree. The defined relationships between individuals help understgnad the potential value of different individual matting decisions. 
-  -Falconer, D.S. and Mackay, T.F.C. (1996) Introduction to Quantitative Genetics. 4th Edition, Addison Wesley Longman, Harlow.
+  - Coancestry (kinship) was classically estimated by pedigree. The defined relationships between individuals help understgnad the potential value of different individual matting decisions. 
+  - Falconer, D.S. and Mackay, T.F.C. (1996) Introduction to Quantitative Genetics. 4th Edition, Addison Wesley Longman, Harlow.
 
 (6) Marker based Kinship Matrix
   -Method for estimating pairwise relationshp between all individuals where data was generated. This method provides more accurate information about relationships than pedigree based kinship estimates. 
