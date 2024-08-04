@@ -1,5 +1,6 @@
 # Steps for getting Climate and Soil data
 **There are several commonly used databases for global climate data**
+
 *Climate Data*
 
 The most commonly used climate data is from Worldclim - https://worldclim.org/data/index.html
