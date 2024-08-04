@@ -3,7 +3,7 @@
 
 ## Common Methods of Population Structure Analysis
 (1) Principal Component Analysis
-  - 
+  - This is one of the fastest analysis that can be done. This is a classic dimentional reduction technique that takes as an input the numeric matrix of marker states, this   analysis requires that there is no missing data. 
 (2) Discriminant Analysis of Principal Components (DAPC)
 (3) Admixture Analysis
 (4) Structure Analysis
