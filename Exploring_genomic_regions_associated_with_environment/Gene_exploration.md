@@ -1,1 +1,3 @@
+# Exploration of Genomic Regions Associated with Environment
 
+Once mixed models have identified significant markers then there are several steps that can be taken to explore potential candidate genes. The first is to use a genome browser for your species of interstest and look up and down-stream of your marker the length of LD in your popualtion. This will help you identify the number of gene models in proximity to your maker. Each species explored will have different level of development, in some cases this means that there is will be well described annotations in others it will mean that you will need to use a comparative genomics approach (e.g. explore Rice or Arabidopsis orthologs). 
