@@ -6,3 +6,9 @@ A well-established tool for genomics-enabled plant breeding is genome-wide selec
 - Li, X., Guo, T., Wang, J., Bekele, W. A., Sukumaran, S., Vanous, A. E., et al. (2021). An integrated framework reinstating the environmental dimension for GWAS and genomic selection in crops. Molecular plant, 14(6), 874-887.
 - Lorenz, A. J., Chao, S., Asoro, F. G., Heffner, E. L., Hayashi, T., Iwata, H., et al. (2011). Genomic selection in plant breeding: knowledge and prospects. Advances in agronomy, 110, 77-123.
 - Meuwissen, T. H., Hayes, B. J., & Goddard, M. (2001). Prediction of total genetic value using genome-wide dense marker maps. genetics, 157(4), 1819-1829.
+# Developing Your Core Collection 
+The ideal training population for germplasm collections is what is termed the 'core collection' (Brown et al., 1989; Yu et al., 2016). Core collections and mini-core collections try to maximize the amount of genetic diversity in the smallest number of accessions (Frankel and Brown, 1984). The development of core and mini-core collections allows a sufficiently diverse subset of a germplasm collection to be evaluated phenotypically for many traits of interest across different environments.
+
+- Frankel, O.H., Brown, A.H.D., 1984. Plant genetic resources today: a critical appraisal. In: Holden, J.H.W., Williams, J.T. (Eds.), Crop Genetic Resources: Conservation and Evaluation. Allen and Unwin, Winchester, pp. 249–257.
+- Brown, A. H. D. (1989). Core collections: a practical approach to genetic resources management. Genome, 31(2), 818-824.
+- Yu, X., Li, X., Guo, T., Zhu, C., Wu, Y., Mitchell, S. E., et al. (2016). Genomic prediction contributing to a promising global strategy to turbocharge gene banks. Nature plants, 2(10), 1-7.
