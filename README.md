@@ -12,14 +12,14 @@ graph LR
   Env1 --> Env3
   Env2 --> Env3
 
-  Gen1[Accession Sequencing Data (.fastq files)]
+  Gen1[Accession Sequencing Data .fastq files]
   Gen2[Reference Genome]
-  Gen3[Cleaned, Aligned, and SNP Called Data (.vcf file)]
-  Gen4[Transformed Numeric SNPs (.txt file)]
+  Gen3[Cleaned, Aligned, and SNP Called Data .vcf file]
+  Gen4[Transformed Numeric SNPs .txt file]
   Gen1 --> Gen2 --> Gen3 --> Gen4
 
   Accession1[Field Sample Collection]
-  Accession2[Accession Unique ID with Location (csv or xlsx)]
+  Accession2[Accession Unique ID with Location csv or xlsx]
   Accession1 --> Accession2
 
 ```
