@@ -1,8 +1,8 @@
 # Genome Enviroment Association Workshop
 
-This is a series of lessons accompanied by scripts to conduct an Genome Environmental Association Analysis and Genomic Environmental Selection Analysis.
+This is a series of lessons accompanied by scripts to conduct Genome Environmental Association Analysis and Genomic Environmental Selection Analysis.
 
-The observation unit for this workshop is an `accession` with the location where it was collected as a `latitude` and `longitude`. The problem is that this information is disconnected from the data capture processes for the environmental data and the lab-based sequencing workflows for genotyping. An highly generalized workflow for GEA can be seen below.
+The observation unit for the data in this workshop is an `accession` with the location where it was collected as a `latitude` and `longitude`. The problem is that this information is disconnected from the data capture processes for the environmental data and the lab-based sequencing workflows for genotyping. An highly generalized workflow for GEA can be seen below.
 
 ```mermaid
 graph LR
@@ -22,9 +22,21 @@ graph LR
   Accession2[Accession Unique ID with Location csv or xlsx]
   Accession1 --> Accession2
 
-```
+  Merge1((Join using Accession ID))
+  IntegratedData1[Integrated Genetic and Accession CSV]
+  Gen4 --> Merge1
+  Accession2 --> Merge1
+  Merge1 --> IntegratedData1
 
-## Environment Workflow
+
+  Merge2((Spatial Join by Accession Latitude and Longitude))
+  IntegratedData2[Spatially Join Soil, \n Climate, Genotyping, and Accession Data]
+  Env3 --> Merge2
+  IntegratedData1 --> Merge2 --> IntegratedData2
+
+
+```
+# Steps
 1) Getting accession geolocation information and mapping accession location
 2) Accessing genomic data
 3) Accessing climate and soil data 
@@ -35,8 +47,3 @@ graph LR
 8) Identifying candidate genomic regions and genes in LD with those regions
 9) Performing the EGS (Environmental Genomic Selection)
 
-# Work Flow Diagram
-
-```mermaid
-
-```
