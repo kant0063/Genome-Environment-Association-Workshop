@@ -1,0 +1,523 @@
+---
+title: "LFMM: Genotype-Environment Association Analysis"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 14,
+  fig.height = 8,
+  fig.align = 'center'
+)
+```
+
+# Introduction
+
+## What is LFMM?
+
+**LFMM (Latent Factor Mixed Models)** is a statistical method for identifying genotype-environment associations (GEA) while controlling for population structure and neutral genetic variation.
+
+**Key features:**
+
+- **Controls for population structure**: Uses latent factors (similar to PCA)
+- **Multiple testing correction**: FDR and Bonferroni adjustments
+- **Scalable**: Works with genome-wide SNP data
+- **Flexible**: Tests multiple environmental variables simultaneously
+
+**Applications:**
+
+- Identify loci under environmental selection
+- Discover candidate genes for adaptation
+- Predict genetic vulnerability to climate change
+- Guide conservation and breeding programs
+
+## How LFMM Works
+
+1. **Input**: Genotype matrix (SNPs × samples) + Environmental variables
+2. **Latent factors (K)**: Capture population structure and confounding effects
+3. **Association testing**: Tests each SNP for correlation with environment
+4. **Correction**: Adjusts p-values for multiple testing
+5. **Output**: Candidate SNPs associated with environmental variables
+
+# Setup
+
+## Load Required Libraries
+
+```{r load-libraries}
+# Load required packages
+library(lfmm)          # LFMM analysis
+library(vcfR)          # VCF file handling
+library(dplyr)         # Data manipulation
+library(ggplot2)       # Plotting
+library(tidyr)         # Data reshaping
+library(knitr)         # Table formatting
+library(kableExtra)    # Enhanced tables
+
+# Optional: Color palettes for visualization
+library(RColorBrewer)
+
+cat("All required packages loaded successfully\n")
+```
+
+## Set File Paths and Parameters
+
+```{r set-parameters}
+# ==================== INPUT FILES ====================
+VCF_FILE <- "your_genotypes.vcf"                    # Path to VCF file
+ENV_CSV <- "your_environmental_data.csv"            # Path to environmental data CSV
+
+# ==================== METADATA COLUMNS ====================
+SAMPLE_ID_COLUMN <- "SampleID"                      # Column name with sample IDs
+LATITUDE_COLUMN <- "Latitude"                       # Latitude column (optional)
+LONGITUDE_COLUMN <- "Longitude"                     # Longitude column (optional)
+
+# Columns to exclude from environmental analysis
+EXCLUDE_COLUMNS <- c("SampleID", "Latitude", "Longitude", "Population", "Site")
+
+# ==================== LFMM PARAMETERS ====================
+K_VALUE <- 6                                        # Number of latent factors
+                                                    # Typically 1-10, based on population structure
+
+# ==================== SIGNIFICANCE THRESHOLDS ====================
+P_VALUE_THRESHOLD <- 0.001                          # Nominal p-value threshold
+FDR_THRESHOLD <- 0.01                               # FDR threshold
+BONFERRONI_ALPHA <- 0.05                            # Alpha for Bonferroni correction
+
+# ==================== OUTPUT OPTIONS ====================
+OUTPUT_PREFIX <- "lfmm"                             # Prefix for output files
+OUTPUT_DIR <- "lfmm_results"                        # Output directory
+
+# Create output directory
+if (!dir.exists(OUTPUT_DIR)) {
+  dir.create(OUTPUT_DIR, recursive = TRUE)
+}
+
+# Display parameters
+param_table <- data.frame(
+  Parameter = c("VCF File", "Environmental CSV", "Sample ID Column", 
+                "Latent Factors (K)", "P-value Threshold", "FDR Threshold"),
+  Value = c(VCF_FILE, ENV_CSV, SAMPLE_ID_COLUMN, 
+            K_VALUE, P_VALUE_THRESHOLD, FDR_THRESHOLD)
+)
+
+kable(param_table, caption = "Analysis Parameters") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+# Data Import and Preparation
+
+## Read VCF File
+
+```{r read-vcf}
+cat("Reading VCF file:", VCF_FILE, "\n")
+
+# Check if file exists
+if (!file.exists(VCF_FILE)) {
+  stop("VCF file not found: ", VCF_FILE)
+}
+
+# Read VCF
+vcf <- read.vcfR(VCF_FILE)
+
+cat("VCF loaded successfully\n")
+cat("  SNPs:", nrow(vcf@fix), "\n")
+cat("  Samples:", ncol(vcf@gt) - 1, "\n")
+
+# Extract genotypes as numeric matrix (0, 1, 2 for diploid genotypes)
+gt_numeric <- extract.gt(vcf, element = "GT", as.numeric = TRUE)
+
+cat("  Genotype matrix dimensions:", dim(gt_numeric), "\n")
+
+# Create VCF summary
+vcf_summary <- data.frame(
+  Metric = c("Total SNPs", "Total Samples", "Missing Genotypes"),
+  Value = c(
+    nrow(gt_numeric),
+    ncol(gt_numeric),
+    paste0(round(100 * sum(is.na(gt_numeric)) / length(gt_numeric), 2), "%")
+  )
+)
+
+kable(vcf_summary, caption = "VCF Data Summary") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## Read Environmental Data
+
+```{r read-environment}
+cat("Reading environmental data:", ENV_CSV, "\n")
+
+# Check if file exists
+if (!file.exists(ENV_CSV)) {
+  stop("Environmental CSV file not found: ", ENV_CSV)
+}
+
+# Read CSV
+env_data <- read.csv(ENV_CSV, header = TRUE, stringsAsFactors = FALSE)
+
+cat("Environmental data loaded\n")
+cat("  Samples:", nrow(env_data), "\n")
+cat("  Columns:", ncol(env_data), "\n")
+
+# Display first few rows
+cat("\nFirst 6 rows of environmental data:\n")
+kable(head(env_data), caption = "Environmental Data Preview") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  scroll_box(width = "100%")
+
+# Check for missing coordinates (if applicable)
+if (LATITUDE_COLUMN %in% colnames(env_data) && LONGITUDE_COLUMN %in% colnames(env_data)) {
+  coords <- env_data[, c(LATITUDE_COLUMN, LONGITUDE_COLUMN)]
+  missing_coords <- which(!complete.cases(coords))
+  
+  if (length(missing_coords) > 0) {
+    cat("\nWARNING:", length(missing_coords), "samples have missing coordinates\n")
+    cat("Row indices:", paste(head(missing_coords, 20), collapse = ", "), 
+        ifelse(length(missing_coords) > 20, "...", ""), "\n")
+    
+    # Option to remove samples with missing coordinates
+    env_data_clean <- env_data[-missing_coords, ]
+    cat("Removed", length(missing_coords), "samples with missing coordinates\n")
+  } else {
+    env_data_clean <- env_data
+    cat("All samples have complete coordinates\n")
+  }
+} else {
+  env_data_clean <- env_data
+}
+
+cat("Clean environmental data:", nrow(env_data_clean), "samples\n")
+```
+
+## Match Samples Between VCF and Environmental Data
+
+```{r match-samples}
+cat("Matching samples between VCF and environmental data...\n")
+
+# Get sample IDs from both datasets
+vcf_samples <- colnames(gt_numeric)
+csv_samples <- env_data_clean[[SAMPLE_ID_COLUMN]]
+
+cat("VCF samples:", length(vcf_samples), "\n")
+cat("CSV samples:", length(csv_samples), "\n")
+
+# Find common samples
+common_samples <- intersect(vcf_samples, csv_samples)
+
+cat("Common samples:", length(common_samples), "\n")
+
+if (length(common_samples) == 0) {
+  stop("ERROR: No matching samples found!\n",
+       "  VCF samples (first 5): ", paste(head(vcf_samples, 5), collapse = ", "), "\n",
+       "  CSV samples (first 5): ", paste(head(csv_samples, 5), collapse = ", "))
+}
+
+# Create matching summary
+match_summary <- data.frame(
+  Category = c("VCF samples", "CSV samples", "Matched samples", 
+               "VCF-only", "CSV-only"),
+  Count = c(
+    length(vcf_samples),
+    length(csv_samples),
+    length(common_samples),
+    length(vcf_samples) - length(common_samples),
+    length(csv_samples) - length(common_samples)
+  )
+)
+
+kable(match_summary, caption = "Sample Matching Summary") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+# Subset both datasets to common samples
+gt_matched <- gt_numeric[, colnames(gt_numeric) %in% common_samples, drop = FALSE]
+csv_matched <- env_data_clean[env_data_clean[[SAMPLE_ID_COLUMN]] %in% common_samples, ]
+
+# Ensure same sample order
+csv_matched <- csv_matched[match(colnames(gt_matched), csv_matched[[SAMPLE_ID_COLUMN]]), ]
+
+cat("\nMatched datasets created\n")
+cat("  Genotype matrix:", dim(gt_matched), "\n")
+cat("  Environmental data:", dim(csv_matched), "\n")
+```
+
+## Prepare Genotype Matrix for LFMM
+
+```{r prepare-genotype}
+cat("Preparing genotype matrix for LFMM...\n")
+
+# Impute missing genotypes with column (SNP) means
+genotype_data <- apply(gt_matched, 2, function(x) {
+  ifelse(is.na(x), mean(x, na.rm = TRUE), x)
+})
+
+# Transpose: LFMM expects individuals as rows, SNPs as columns
+genotype_data <- t(genotype_data)
+
+cat("Final genotype matrix dimensions (individuals × SNPs):", dim(genotype_data), "\n")
+cat("Missing values after imputation:", sum(is.na(genotype_data)), "\n")
+```
+
+# Multiple Environmental Variables Analysis
+
+## Loop Through All Environmental Variables
+
+```{r loop-environmental-variables}
+cat("Identifying environmental columns...\n")
+
+# Identify environmental columns (exclude metadata)
+env_cols <- setdiff(colnames(csv_matched), EXCLUDE_COLUMNS)
+
+cat("Environmental variables to analyze:", length(env_cols), "\n")
+cat("Variables:", paste(env_cols, collapse = ", "), "\n\n")
+
+# Initialize list to store results
+all_lfmm_results <- list()
+
+# Loop through all environmental variables
+for (env_var in env_cols) {
+  cat("Processing environmental variable:", env_var, "\n")
+  
+  # Extract current environmental variable
+  env_matrix <- as.matrix(csv_matched[, env_var, drop = FALSE])
+  
+  # Handle missing values - impute with mean
+  env_matrix[is.na(env_matrix)] <- mean(env_matrix, na.rm = TRUE)
+  
+  # Check if there's variation in the environmental variable
+  if (var(env_matrix, na.rm = TRUE) == 0) {
+    cat("  Skipping", env_var, "- no variation in data\n")
+    next
+  }
+  
+  # Run LFMM
+  tryCatch({
+    mod.lfmm <- lfmm_ridge(Y = genotype_data, X = env_matrix, K = K_VALUE)
+    pv <- lfmm_test(Y = genotype_data, X = env_matrix, lfmm = mod.lfmm)
+    
+    # Store results with chromosome and position information
+    lfmm_results <- data.frame(
+      SNP = 1:ncol(genotype_data), 
+      p_value = pv$pvalue[, 1], 
+      log_p = -log10(pv$pvalue[, 1]),
+      env_variable = env_var
+    )
+    
+    # Add chromosome and position information
+    lfmm_results <- cbind(
+      lfmm_results, 
+      chromosome = as.factor(vcf@fix[, "CHROM"]), 
+      pos = as.numeric(vcf@fix[, "POS"])
+    )
+    
+    # Add results to list
+    all_lfmm_results[[env_var]] <- lfmm_results
+    
+    cat("  Completed LFMM for", env_var, "\n")
+    cat("    Significant SNPs (p < 0.05):", 
+        sum(lfmm_results$p_value < 0.05, na.rm = TRUE), "\n")
+    
+  }, error = function(e) {
+    cat("  Error processing", env_var, ":", e$message, "\n")
+  })
+}
+
+cat("\nAnalysis complete!\n")
+cat("Total environmental variables processed:", length(all_lfmm_results), "\n")
+```
+
+## Combine Results
+
+```{r combine-results}
+if (length(all_lfmm_results) > 0) {
+  # Combine all results into one data frame
+  combined_results <- do.call(rbind, all_lfmm_results)
+  
+  cat("Combined results dimensions:", dim(combined_results), "\n")
+  
+  # Calculate FDR and other statistics per environmental variable
+  combined_results <- combined_results %>%
+    group_by(env_variable) %>%
+    mutate(
+      bonferroni_threshold = -log10(BONFERRONI_ALPHA / n()),
+      fdr_p_value = p.adjust(p_value, method = "BH"),
+      log_fdr_p = -log10(fdr_p_value)
+    ) %>%
+    ungroup()
+  
+  # Add chromosome numeric mapping for plotting
+  unique_chroms <- unique(combined_results$chromosome)
+  chromosome_mapping <- setNames(1:length(unique_chroms), unique_chroms)
+  
+  combined_results <- combined_results %>%
+    mutate(chromosome_numeric = chromosome_mapping[as.character(chromosome)])
+  
+  cat("Combined results prepared for visualization\n")
+  
+} else {
+  stop("No environmental variables were successfully processed.")
+}
+```
+
+## Summary Statistics
+
+```{r summary-statistics}
+# Calculate summary statistics for each environmental variable
+summary_stats <- combined_results %>%
+  group_by(env_variable) %>%
+  summarise(
+    total_snps = n(),
+    bonferroni_significant = sum(p_value < (BONFERRONI_ALPHA / n()), na.rm = TRUE),
+    fdr_significant = sum(fdr_p_value < FDR_THRESHOLD, na.rm = TRUE),
+    p_001_significant = sum(p_value < P_VALUE_THRESHOLD, na.rm = TRUE),
+    mean_log_p = round(mean(log_p, na.rm = TRUE), 3),
+    max_log_p = round(max(log_p, na.rm = TRUE), 3),
+    .groups = 'drop'
+  )
+
+kable(summary_stats, 
+      caption = "Summary of Significant SNPs per Environmental Variable") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+# Visualization
+
+## Faceted Manhattan Plots
+
+```{r faceted-manhattan, fig.width=16, fig.height=12}
+# Create faceted Manhattan plot for all environmental variables
+p_faceted <- ggplot(combined_results, 
+                    aes(x = SNP, y = log_p, color = as.factor(chromosome_numeric))) +
+  geom_point(alpha = 0.6, size = 0.5) +
+  geom_hline(data = combined_results %>% 
+               group_by(env_variable) %>% 
+               slice(1) %>% 
+               ungroup(), 
+             aes(yintercept = bonferroni_threshold), 
+             color = "red", linetype = "dashed", alpha = 0.7) +
+  geom_hline(yintercept = -log10(FDR_THRESHOLD), 
+             color = "purple", linetype = "dashed", alpha = 0.7) +
+  facet_wrap(~ env_variable, scales = "free_y", ncol = 3) +
+  labs(
+    title = "Manhattan Plots for All Environmental Variables",
+    x = "SNP Index",
+    y = "-log10(p-value)",
+    color = "Chromosome",
+    caption = "Red: Bonferroni threshold (per variable); Purple: FDR threshold"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(size = 8),
+    axis.text.y = element_text(size = 8),
+    plot.title = element_text(size = 14, hjust = 0.5, face = "bold"),
+    strip.text = element_text(size = 9, face = "bold"),
+    plot.caption = element_text(size = 9, hjust = 0),
+    panel.spacing = unit(0.5, "lines")
+  ) +
+  scale_color_brewer(palette = "Set3", guide = guide_legend(nrow = 2))
+
+print(p_faceted)
+```
+
+## Summary Bar Plot
+
+```{r summary-barplot, fig.width=12, fig.height=6}
+# Create summary plot showing number of significant SNPs per environmental variable
+summary_plot <- summary_stats %>%
+  select(env_variable, bonferroni_significant, fdr_significant, p_001_significant) %>%
+  pivot_longer(cols = -env_variable, names_to = "threshold_type", values_to = "count") %>%
+  mutate(threshold_type = case_when(
+    threshold_type == "bonferroni_significant" ~ "Bonferroni",
+    threshold_type == "fdr_significant" ~ paste0("FDR < ", FDR_THRESHOLD),
+    threshold_type == "p_001_significant" ~ paste0("p < ", P_VALUE_THRESHOLD)
+  )) %>%
+  ggplot(aes(x = reorder(env_variable, -count), y = count, fill = threshold_type)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  labs(
+    title = "Number of Significant SNPs by Environmental Variable",
+    x = "Environmental Variable",
+    y = "Number of Significant SNPs",
+    fill = "Significance Threshold"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    legend.position = "bottom"
+  ) +
+  scale_fill_brewer(type = "qual", palette = "Set2")
+
+print(summary_plot)
+```
+
+# Save Results
+
+```{r save-results}
+cat("Saving results to disk...\n")
+
+# Save combined results
+write.csv(combined_results, 
+          file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_all_variables.csv")), 
+          row.names = FALSE)
+cat("Saved:", file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_all_variables.csv")), "\n")
+
+# Save summary statistics
+write.csv(summary_stats, 
+          file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_summary.csv")), 
+          row.names = FALSE)
+cat("Saved:", file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_summary.csv")), "\n")
+
+# Save individual result files for each environmental variable
+for (env_var in names(all_lfmm_results)) {
+  filename <- file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_", env_var, ".csv"))
+  write.csv(all_lfmm_results[[env_var]], filename, row.names = FALSE)
+}
+cat("Saved individual files for each environmental variable\n")
+
+# Save plots
+ggsave(file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_manhattan_faceted.png")), 
+       plot = p_faceted, 
+       width = 16, height = 12, dpi = 300, units = "in")
+cat("Saved faceted Manhattan plot\n")
+
+ggsave(file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_summary_barplot.png")), 
+       plot = summary_plot, 
+       width = 12, height = 6, dpi = 300, units = "in")
+cat("Saved summary bar plot\n")
+
+cat("\nAll results saved successfully!\n")
+cat("Output directory:", OUTPUT_DIR, "\n")
+```
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
+
+# References
+
+1. Caye, K., et al. (2019). LFMM 2: Fast and accurate inference of gene-environment associations in genome-wide studies. *Molecular Biology and Evolution*, 36(4), 852-860.
+
+2. Frichot, E., & François, O. (2015). LEA: An R package for landscape and ecological association studies. *Methods in Ecology and Evolution*, 6(8), 925-929.
+
+---
+
+**Analysis completed:** `r Sys.time()`
