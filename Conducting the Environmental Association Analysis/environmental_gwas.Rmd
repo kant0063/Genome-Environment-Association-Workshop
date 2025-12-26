@@ -1,0 +1,994 @@
+---
+title: "Environmental Genome-Wide Association Study (eGWAS)"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    theme: cosmo
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 12,
+  fig.height = 8
+)
+```
+
+## Overview
+
+This analysis performs **environmental Genome-Wide Association Study (eGWAS)** to identify genetic variants associated with environmental variables. The approach uses linear mixed models (LMM) with various population structure corrections.
+
+**Key Features:**
+
+- VCF file processing and quality control
+- Kinship matrix calculation for relatedness
+- Multiple population structure correction strategies
+- Genomic inflation factor (λ) calculation
+- FDR-corrected significance testing
+- Manhattan and QQ plots for visualization
+- Variance partitioning analysis
+
+## Methods
+
+### Association Model
+
+Linear mixed model for environmental association:
+
+$$y = X\beta + Zu + \epsilon$$
+
+Where:
+- $y$ = environmental variable values
+- $X$ = fixed effects matrix (population structure: PCs)
+- $\beta$ = fixed effect coefficients
+- $Z$ = genotype design matrix
+- $u \sim N(0, K\sigma^2_g)$ = random polygenic effects
+- $K$ = kinship matrix
+- $\epsilon$ = residual error
+
+**Population structure correction strategies:**
+
+1. **Model 1**: Kinship only (K)
+2. **Model 2**: Kinship + 3 PCs (K + PC1-3)
+3. **Model 3**: Kinship + 10 PCs (K + PC1-10)
+
+The best model is selected based on genomic inflation factor (λ ≈ 1).
+
+## Configuration
+
+**Edit these parameters for your analysis:**
+
+```{r config}
+# ============================================
+# INPUT FILES
+# ============================================
+
+# VCF file with genotype data
+vcf_file <- "path/to/your/genotypes.vcf"
+
+# CSV file with environmental data
+# Required columns: sample_id (matching VCF), environmental variables
+# Optional columns: latitude, longitude (excluded from analysis)
+env_file <- "path/to/your/environment.csv"
+
+# ============================================
+# OUTPUT DIRECTORIES
+# ============================================
+
+output_dir <- "egwas_output"
+figures_dir <- "egwas_figures"
+
+# ============================================
+# ANALYSIS PARAMETERS
+# ============================================
+
+# Quality control thresholds
+min_maf <- 0.05              # Minimum minor allele frequency
+missing_thresh <- 0.10       # Maximum proportion missing data per marker
+
+# Significance thresholds
+fdr_threshold <- 0.20        # FDR threshold for significance
+
+# Population structure
+n_pcs_model2 <- 3            # Number of PCs for model 2
+n_pcs_model3 <- 10           # Number of PCs for model 3
+```
+
+## Load Required Libraries
+
+```{r libraries}
+# CRITICAL NOTE: Package conflicts
+# Several packages mask dplyr functions (especially select, filter, rename)
+# Functions are called with dplyr:: prefix throughout this script
+# Do NOT remove the dplyr:: prefixes or you will get errors
+
+# Load required packages
+required_packages <- c(
+  "vcfR",      # VCF file reading
+  "sommer",    # Mixed models and FDR
+  "tidyverse", # Data manipulation
+  "rrBLUP",    # GWAS and kinship
+  "qvalue",    # FDR correction
+  "QCEWAS",    # Genomic inflation
+  "qqman"      # Manhattan/QQ plots
+)
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop("Required package '", pkg, "' is not installed.\n",
+         "Please install it with: install.packages('", pkg, "')")
+  }
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}
+
+# Create output directories
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(figures_dir, showWarnings = FALSE, recursive = TRUE)
+
+cat("All libraries loaded successfully.\n")
+cat("Output directories created.\n")
+```
+
+## Read and Process VCF File
+
+```{r read_vcf}
+cat("Reading VCF file...\n")
+
+# Check if file exists
+if (!file.exists(vcf_file)) {
+  stop("VCF file not found: ", vcf_file)
+}
+
+vcf <- read.vcfR(vcf_file, verbose = FALSE)
+
+cat("VCF file loaded:\n")
+cat("  Variants:", nrow(vcf@fix), "\n")
+cat("  Samples: ", ncol(vcf@gt) - 1, "\n\n")
+```
+
+### Convert Genotypes to Numeric Format
+
+```{r convert_genotypes}
+cat("Converting genotypes to numeric format...\n")
+
+# Extract genotype matrix
+geno_mat <- extract.gt(vcf, element = "GT")
+
+# Convert VCF genotypes to numeric (-1, 0, 1)
+# 0/0 or 0|0 → -1 (homozygous reference)
+# 0/1 or 0|1 or 1|0 → 0 (heterozygous)
+# 1/1 or 1|1 → 1 (homozygous alternate)
+
+geno_numeric <- matrix(NA, nrow = nrow(geno_mat), ncol = ncol(geno_mat))
+rownames(geno_numeric) <- rownames(geno_mat)
+colnames(geno_numeric) <- colnames(geno_mat)
+
+pb <- txtProgressBar(min = 0, max = nrow(geno_mat), style = 3)
+
+for (i in 1:nrow(geno_mat)) {
+  for (j in 1:ncol(geno_mat)) {
+    gt <- geno_mat[i, j]
+    if (is.na(gt)) {
+      geno_numeric[i, j] <- NA
+    } else if (gt == "0/0" || gt == "0|0") {
+      geno_numeric[i, j] <- -1
+    } else if (gt == "0/1" || gt == "0|1" || gt == "1|0") {
+      geno_numeric[i, j] <- 0
+    } else if (gt == "1/1" || gt == "1|1") {
+      geno_numeric[i, j] <- 1
+    } else {
+      # Handle multiallelic or other cases
+      alleles <- as.numeric(unlist(strsplit(gt, "[/|]")))
+      geno_numeric[i, j] <- sum(alleles) - 1
+    }
+  }
+  
+  if (i %% 1000 == 0) setTxtProgressBar(pb, i)
+}
+
+close(pb)
+
+# Transpose: samples as rows, markers as columns
+geno_mat_t <- t(geno_numeric)
+
+cat("\nGenotype matrix transposed:", nrow(geno_mat_t), "samples x", 
+    ncol(geno_mat_t), "markers\n")
+```
+
+### Remove Monomorphic Markers
+
+```{r remove_monomorphic}
+cat("\nChecking for monomorphic markers...\n")
+
+is_polymorphic <- apply(geno_mat_t, 2, function(x) {
+  x_clean <- x[!is.na(x)]
+  length(unique(x_clean)) > 1
+})
+
+n_monomorphic <- sum(!is_polymorphic)
+
+if (n_monomorphic > 0) {
+  cat("Removing", n_monomorphic, "monomorphic markers\n")
+  geno_mat_t <- geno_mat_t[, is_polymorphic]
+  geno_numeric <- geno_numeric[is_polymorphic, ]
+}
+
+# Create SNP information data frame
+snp_info <- data.frame(
+  marker = rownames(geno_numeric),
+  chrom = getCHROM(vcf)[is_polymorphic],
+  pos = getPOS(vcf)[is_polymorphic],
+  stringsAsFactors = FALSE
+)
+
+cat("After removing monomorphic markers:\n")
+cat("  Markers:", nrow(snp_info), "\n")
+cat("  Samples:", ncol(geno_mat_t), "\n")
+```
+
+## Read Environmental Data
+
+```{r read_env}
+cat("\nReading environmental data...\n")
+
+# Check if file exists
+if (!file.exists(env_file)) {
+  stop("Environmental data file not found: ", env_file)
+}
+
+env_data <- read.csv(env_file, stringsAsFactors = FALSE)
+
+cat("Environmental data loaded:\n")
+cat("  Samples:", nrow(env_data), "\n")
+cat("  Variables:", ncol(env_data), "\n\n")
+
+# Check for sample_id column
+if (!"sample_id" %in% colnames(env_data)) {
+  colnames(env_data)[1] <- "sample_id"
+  cat("Note: Assuming first column contains sample IDs\n")
+}
+
+# Identify environmental variables
+env_vars <- setdiff(colnames(env_data), c("sample_id", "latitude", "longitude"))
+
+cat("Found", length(env_vars), "environmental variables:\n")
+cat(paste(head(env_vars, 10), collapse = ", "), 
+    if(length(env_vars) > 10) "..." else "", "\n\n")
+
+# Display preview
+cat("Environmental data preview:\n")
+print(head(env_data))
+```
+
+## Match Samples
+
+```{r match_samples}
+# Find common samples between genotype and environmental data
+common_samples <- intersect(rownames(geno_mat_t), env_data$sample_id)
+
+cat("\nSample matching:\n")
+cat("  Genotype samples:     ", nrow(geno_mat_t), "\n")
+cat("  Environment samples:  ", nrow(env_data), "\n")
+cat("  Common samples:       ", length(common_samples), "\n\n")
+
+if (length(common_samples) == 0) {
+  stop("No common samples found! Check that sample IDs match between VCF and CSV files.")
+}
+
+# Subset to common samples
+geno_mat_t <- geno_mat_t[common_samples, ]
+env_data <- env_data[match(common_samples, env_data$sample_id), ]
+
+cat("Datasets matched to", length(common_samples), "common samples\n")
+```
+
+## Quality Control and Filtering
+
+```{r qc_filtering}
+cat("\nPerforming quality control...\n")
+
+# Calculate missing data per marker
+missing_per_marker <- colMeans(is.na(geno_mat_t))
+markers_to_keep <- missing_per_marker <= missing_thresh
+
+cat("Removed", sum(!markers_to_keep), "markers with >", 
+    missing_thresh * 100, "% missing data\n")
+
+geno_mat_filtered <- geno_mat_t[, markers_to_keep]
+snp_info_filtered <- snp_info[markers_to_keep, ]
+
+# Calculate minor allele frequency
+maf <- apply(geno_mat_filtered, 2, function(x) {
+  x <- x[!is.na(x)]
+  p <- (sum(x == 1) + 2 * sum(x == 0)) / (2 * length(x))
+  return(min(p, 1 - p))
+})
+
+# Filter by MAF
+markers_pass_maf <- maf >= min_maf
+cat("Removed", sum(!markers_pass_maf), "markers with MAF <", min_maf, "\n")
+
+geno_mat_final <- geno_mat_filtered[, markers_pass_maf]
+snp_info_final <- snp_info_filtered[markers_pass_maf, ]
+
+cat("\nFinal filtered dataset:\n")
+cat("  Samples: ", nrow(geno_mat_final), "\n")
+cat("  Markers: ", ncol(geno_mat_final), "\n\n")
+
+# Impute missing genotypes with column means
+cat("Imputing missing genotypes...\n")
+for (j in 1:ncol(geno_mat_final)) {
+  missing_idx <- is.na(geno_mat_final[, j])
+  if (any(missing_idx)) {
+    geno_mat_final[missing_idx, j] <- mean(geno_mat_final[, j], na.rm = TRUE)
+  }
+}
+cat("Imputation complete\n")
+```
+
+### QC Summary Plot
+
+```{r plot_qc, fig.width=12, fig.height=5}
+# Create QC summary plots
+par(mfrow = c(1, 2))
+
+# MAF distribution
+hist(maf[markers_pass_maf], breaks = 50, 
+     main = "Minor Allele Frequency Distribution",
+     xlab = "MAF", col = "steelblue", border = "white")
+abline(v = min_maf, col = "red", lwd = 2, lty = 2)
+
+# Missing data distribution
+hist(missing_per_marker[markers_to_keep], breaks = 50,
+     main = "Missing Data per Marker",
+     xlab = "Proportion Missing", col = "coral", border = "white")
+abline(v = missing_thresh, col = "red", lwd = 2, lty = 2)
+```
+
+## Calculate Kinship Matrix
+
+```{r kinship}
+cat("\nCalculating kinship matrix...\n")
+
+K <- A.mat(geno_mat_final, min.MAF = 0, max.missing = 1)
+
+cat("Kinship matrix calculated:", nrow(K), "x", ncol(K), "\n")
+
+# Summary statistics
+cat("Kinship matrix summary:\n")
+cat("  Mean relatedness:  ", round(mean(K[lower.tri(K)]), 4), "\n")
+cat("  Median relatedness:", round(median(K[lower.tri(K)]), 4), "\n")
+cat("  Range:             ", round(min(K), 4), "to", round(max(K), 4), "\n")
+```
+
+### Visualize Kinship Matrix
+
+```{r plot_kinship, fig.width=10, fig.height=9}
+# Heatmap of kinship matrix
+heatmap(K, 
+        col = colorRampPalette(c("blue", "white", "red"))(100),
+        main = "Kinship Matrix Heatmap",
+        margins = c(8, 8),
+        cexRow = 0.5,
+        cexCol = 0.5)
+```
+
+## Calculate Principal Components
+
+```{r pca}
+cat("\nCalculating principal components from kinship matrix...\n")
+
+K_pca <- prcomp(K)
+
+# Extract PCs
+K_eigens <- K_pca$x[, 1:max(n_pcs_model2, n_pcs_model3)] %>%
+  as.data.frame() %>%
+  rownames_to_column("sample_id")
+
+# Variance explained
+var_exp <- summary(K_pca)$importance[2, ]
+
+cat("Variance explained by top PCs:\n")
+for (i in 1:min(10, length(var_exp))) {
+  cat("  PC", i, ": ", round(var_exp[i] * 100, 2), "%\n", sep = "")
+}
+```
+
+### PCA Plots
+
+```{r plot_pca, fig.width=12, fig.height=5}
+par(mfrow = c(1, 2))
+
+# PC1 vs PC2
+plot(K_pca$x[, 1], K_pca$x[, 2],
+     xlab = paste0("PC1 (", round(var_exp[1] * 100, 1), "%)"),
+     ylab = paste0("PC2 (", round(var_exp[2] * 100, 1), "%)"),
+     main = "PCA of Kinship Matrix",
+     pch = 16, col = alpha("steelblue", 0.6))
+
+# Scree plot
+plot(1:min(20, length(var_exp)), var_exp[1:min(20, length(var_exp))] * 100,
+     type = "b", pch = 16,
+     xlab = "Principal Component",
+     ylab = "Variance Explained (%)",
+     main = "Scree Plot",
+     col = "darkblue", lwd = 2)
+grid()
+```
+
+## Prepare Data for GWAS
+
+```{r prepare_gwas}
+cat("\nPreparing data for GWAS...\n")
+
+# Format genotype data for rrBLUP
+geno_df <- t(geno_mat_final) %>%
+  as.data.frame() %>%
+  rownames_to_column("marker") %>%
+  dplyr::inner_join(snp_info_final, ., by = "marker") %>%
+  as.data.frame()
+
+# Ensure correct column order: marker, chrom, pos, then individuals
+col_order <- c("marker", "chrom", "pos", rownames(geno_mat_final))
+geno_df <- geno_df[, col_order]
+
+cat("Genotype data formatted:\n")
+cat("  Markers:    ", nrow(geno_df), "\n")
+cat("  Individuals:", ncol(geno_df) - 3, "\n\n")
+
+# Prepare phenotype (environmental) data
+pheno <- env_data %>%
+  dplyr::select(sample_id, all_of(env_vars)) %>%
+  dplyr::rename(individual = sample_id) %>%
+  as.data.frame()
+
+cat("Phenotype data prepared:\n")
+cat("  Individuals:", nrow(pheno), "\n")
+cat("  Variables:  ", ncol(pheno) - 1, "\n")
+```
+
+## Run eGWAS with Multiple Models
+
+```{r run_egwas}
+cat("\nRunning environmental GWAS...\n")
+cat("Testing", length(env_vars), "environmental variables\n")
+cat("Using 3 population structure correction models\n\n")
+
+# Initialize storage for results
+egwas_models <- list()
+
+# Define models
+models <- list(
+  model1 = list(name = "K only", n_pcs = 0),
+  model2 = list(name = paste0("K + ", n_pcs_model2, " PCs"), n_pcs = n_pcs_model2),
+  model3 = list(name = paste0("K + ", n_pcs_model3, " PCs"), n_pcs = n_pcs_model3)
+)
+
+# Run GWAS for each model
+for (model_name in names(models)) {
+  model_info <- models[[model_name]]
+  
+  cat("Running", model_info$name, "...\n")
+  
+  # Prepare fixed effects
+  if (model_info$n_pcs > 0) {
+    pc_cols <- paste0("PC", 1:model_info$n_pcs)
+    pheno_with_pcs <- pheno %>%
+      dplyr::left_join(K_eigens[, c("sample_id", pc_cols)], 
+                       by = c("individual" = "sample_id"))
+    fixed <- as.matrix(pheno_with_pcs[, pc_cols])
+  } else {
+    pheno_with_pcs <- pheno
+    fixed <- NULL
+  }
+  
+  # Run GWAS for each environmental variable
+  model_results <- list()
+  
+  pb <- txtProgressBar(min = 0, max = length(env_vars), style = 3)
+  
+  for (i in seq_along(env_vars)) {
+    var <- env_vars[i]
+    
+    tryCatch({
+      # Prepare phenotype for this variable
+      y <- pheno_with_pcs[[var]]
+      
+      # Run GWAS
+      gwas_result <- GWAS(
+        pheno = data.frame(individual = pheno_with_pcs$individual, trait = y),
+        geno = geno_df,
+        K = K,
+        fixed = fixed,
+        n.PC = 0,  # PCs already in fixed
+        min.MAF = 0,
+        n.core = 1,
+        P3D = TRUE,
+        plot = FALSE
+      )
+      
+      # Store results
+      model_results[[var]] <- gwas_result %>%
+        mutate(variable = var, model = model_name)
+      
+    }, error = function(e) {
+      cat("\n  Error with", var, ":", e$message, "\n")
+      model_results[[var]] <- NULL
+    })
+    
+    setTxtProgressBar(pb, i)
+  }
+  
+  close(pb)
+  
+  # Combine results for this model
+  egwas_models[[model_name]] <- bind_rows(model_results)
+  
+  cat("\n", model_info$name, "complete:", nrow(egwas_models[[model_name]]), "tests\n\n")
+}
+
+# Combine all models
+gwas_combined <- bind_rows(egwas_models)
+
+cat("Total GWAS tests completed:", nrow(gwas_combined), "\n")
+```
+
+## Calculate Genomic Inflation Factors
+
+```{r lambda}
+cat("\nCalculating genomic inflation factors (λ)...\n")
+
+# Calculate lambda for each variable and model
+p_lambda <- gwas_combined %>%
+  group_by(variable, model) %>%
+  summarise(
+    n_markers = n(),
+    lambda = median(qchisq(1 - trait, 1), na.rm = TRUE) / qchisq(0.5, 1),
+    .groups = "drop"
+  ) %>%
+  arrange(variable, lambda)
+
+# Identify best model for each variable (λ closest to 1)
+p_lambda <- p_lambda %>%
+  group_by(variable) %>%
+  mutate(
+    best_model = model[which.min(abs(lambda - 1))],
+    is_best = model == best_model
+  ) %>%
+  ungroup()
+
+cat("\nGenomic inflation factors:\n")
+print(p_lambda)
+```
+
+### Lambda Summary Plot
+
+```{r plot_lambda, fig.width=10, fig.height=6}
+ggplot(p_lambda, aes(x = variable, y = lambda, fill = model)) +
+  geom_col(position = "dodge") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red", size = 1) +
+  labs(
+    title = "Genomic Inflation Factor by Model",
+    subtitle = "Values close to 1 indicate good population structure correction",
+    x = "Environmental Variable",
+    y = "Genomic Inflation Factor (λ)",
+    fill = "Model"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 11, color = "gray50")
+  ) +
+  scale_fill_brewer(palette = "Set2")
+```
+
+## Process GWAS Results
+
+```{r process_results}
+cat("\nProcessing GWAS results...\n")
+
+# Add -log10(p-value) and uniform score
+gwas_analyzed <- gwas_combined %>%
+  mutate(
+    p_value = trait,  # GWAS function returns p-values in 'trait' column
+    log10p = -log10(p_value),
+    unif_score = rank(p_value) / length(p_value)
+  )
+
+cat("GWAS results processed:", nrow(gwas_analyzed), "tests\n")
+```
+
+## QQ Plots
+
+```{r qq_plots, fig.width=12, fig.height=ceiling(length(env_vars)/3)*4}
+cat("\nGenerating QQ plots...\n")
+
+# Calculate grid dimensions
+n_vars <- length(env_vars)
+n_cols <- 3
+n_rows <- ceiling(n_vars / n_cols)
+
+par(mfrow = c(n_rows, n_cols), mar = c(4, 4, 3, 1))
+
+for (var in env_vars) {
+  for (model_name in names(models)) {
+    
+    # Get data for this variable and model
+    var_data <- gwas_analyzed %>%
+      dplyr::filter(variable == var, model == model_name, !is.na(p_value))
+    
+    if (nrow(var_data) > 0) {
+      # Create QQ plot
+      qq(var_data$p_value, 
+         main = paste0(var, " (", model_name, ")"))
+    }
+  }
+}
+
+cat("QQ plots generated\n")
+```
+
+## Identify Significant Markers
+
+```{r significant_markers}
+cat("\nIdentifying significant markers...\n")
+
+# Use model2 (K + 3 PCs) as default best model
+# Modify based on your p_lambda results
+sig_markers <- gwas_analyzed %>%
+  dplyr::filter(model == "model2") %>%
+  group_by(variable) %>%
+  group_split() %>%
+  map_dfr(function(df) {
+    var_name <- df$variable[1]
+    p_vals <- df$p_value[!is.na(df$p_value)]
+    
+    if (length(p_vals) == 0) return(tibble())
+    
+    # Calculate FDR
+    fdr_result <- sommer:::fdr(p_vals, fdr.level = fdr_threshold)
+    threshold <- fdr_result$fdr.10
+    
+    sig <- df %>%
+      dplyr::filter(p_value <= threshold) %>%
+      arrange(p_value)
+    
+    if (nrow(sig) > 0) {
+      cat("  ", var_name, ":", nrow(sig), "significant markers\n")
+    }
+    
+    return(sig)
+  })
+
+cat("\nTotal significant markers:", nrow(sig_markers), "\n")
+
+if (nrow(sig_markers) > 0) {
+  cat("\nTop significant markers:\n")
+  print(head(sig_markers %>% 
+               dplyr::select(variable, marker, chrom, pos, p_value) %>%
+               arrange(p_value), 20))
+}
+```
+
+## Manhattan Plots
+
+```{r manhattan_plots, fig.width=14, fig.height=ceiling(length(env_vars)/2)*4}
+if (nrow(sig_markers) > 0) {
+  cat("\nGenerating Manhattan plots...\n")
+  
+  par(mfrow = c(ceiling(length(env_vars)/2), 2), mar = c(4, 4, 3, 1))
+  
+  for (var in env_vars) {
+    
+    # Get best model for this variable
+    best_model_var <- p_lambda %>%
+      dplyr::filter(variable == var, is_best) %>%
+      pull(model)
+    
+    if (length(best_model_var) == 0) {
+      best_model_var <- "model2"
+    }
+    
+    # Get data
+    var_data <- gwas_analyzed %>%
+      dplyr::filter(variable == var, model == best_model_var) %>%
+      dplyr::filter(!is.na(p_value), p_value > 0)
+    
+    if (nrow(var_data) > 0) {
+      # Prepare for manhattan plot
+      manhattan_data <- var_data %>%
+        dplyr::select(marker, chrom, pos, p_value) %>%
+        dplyr::rename(SNP = marker, CHR = chrom, BP = pos, P = p_value)
+      
+      # Convert chromosome to numeric if needed
+      if (!is.numeric(manhattan_data$CHR)) {
+        manhattan_data$CHR <- as.numeric(factor(manhattan_data$CHR))
+      }
+      
+      # Create plot
+      tryCatch({
+        manhattan(manhattan_data,
+                 chr = "CHR", bp = "BP", p = "P", snp = "SNP",
+                 main = paste0(var, " (", best_model_var, ")"),
+                 col = c("blue4", "orange3"),
+                 suggestiveline = -log10(0.05),
+                 genomewideline = -log10(fdr_threshold / nrow(manhattan_data)),
+                 cex = 0.5)
+      }, error = function(e) {
+        plot.new()
+        text(0.5, 0.5, paste("Error:", var), cex = 1)
+      })
+    } else {
+      plot.new()
+      text(0.5, 0.5, paste("No data:", var), cex = 1.5)
+    }
+  }
+  
+  cat("Manhattan plots generated\n")
+}
+```
+
+## Variance Partitioning
+
+Calculate variance explained by significant markers.
+
+```{r variance_explained}
+cat("\nCalculating variance explained by significant markers...\n")
+
+variance_explained <- list()
+
+if (nrow(sig_markers) > 0) {
+  
+  # Merge phenotype with PCs
+  pheno_with_pcs <- pheno %>%
+    dplyr::left_join(K_eigens[, c("sample_id", paste0("PC", 1:n_pcs_model2))], 
+                     by = c("individual" = "sample_id"))
+  
+  for (var_name in unique(sig_markers$variable)) {
+    
+    cat("  Processing", var_name, "...\n")
+    
+    # Get significant markers
+    sig_mar_var <- sig_markers %>%
+      dplyr::filter(variable == var_name) %>%
+      pull(marker)
+    
+    if (length(sig_mar_var) == 0) next
+    
+    # Prepare model components
+    y <- pheno_with_pcs[[var_name]]
+    X <- model.matrix(~ PC1 + PC2 + PC3, data = pheno_with_pcs)
+    Z <- model.matrix(~ -1 + individual, data = pheno_with_pcs)
+    
+    # Fit mixed model
+    mm_fit <- mixed.solve(y = y, Z = Z, K = K, X = X, method = "REML")
+    
+    # Calculate adjusted values
+    y_adj <- y - ((X %*% mm_fit$beta) + (Z %*% mm_fit$u))
+    
+    # Get genotypes for significant markers
+    geno_sig <- geno_mat_final[, sig_mar_var, drop = FALSE]
+    
+    # Fit marker model
+    model_data <- data.frame(y_adj = as.numeric(y_adj), geno_sig)
+    
+    if (ncol(geno_sig) > 1) {
+      marker_model <- lm(y_adj ~ ., data = model_data)
+      marker_model_step <- step(marker_model, trace = 0)
+    } else {
+      marker_model_step <- lm(y_adj ~ ., data = model_data)
+    }
+    
+    # Calculate variance components
+    pop_structure_r2 <- var(X %*% mm_fit$beta) / var(y)
+    polygenic_r2 <- mm_fit$Vu / var(y)
+    residual_r2 <- 1 - (pop_structure_r2 + polygenic_r2)
+    marker_r2 <- summary(marker_model_step)$adj.r.squared
+    
+    variance_explained[[var_name]] <- tibble(
+      variable = var_name,
+      n_sig_markers = length(sig_mar_var),
+      n_retained_markers = length(coef(marker_model_step)) - 1,
+      pop_structure_var_exp = pop_structure_r2,
+      polygenic_var_exp = polygenic_r2,
+      markers_var_exp = marker_r2 * residual_r2,
+      total_var_exp = pop_structure_r2 + polygenic_r2 + (marker_r2 * residual_r2)
+    )
+  }
+  
+  variance_df <- bind_rows(variance_explained)
+  
+  cat("\nVariance explained summary:\n")
+  print(variance_df)
+  
+} else {
+  cat("  No significant markers found\n")
+  variance_df <- tibble()
+}
+```
+
+### Variance Partitioning Plot
+
+```{r plot_variance, fig.width=10, fig.height=6}
+if (nrow(variance_df) > 0) {
+  
+  # Reshape for plotting
+  var_plot_data <- variance_df %>%
+    dplyr::select(variable, pop_structure_var_exp, polygenic_var_exp, markers_var_exp) %>%
+    pivot_longer(cols = -variable, names_to = "component", values_to = "variance") %>%
+    mutate(
+      component = factor(
+        component,
+        levels = c("pop_structure_var_exp", "polygenic_var_exp", "markers_var_exp"),
+        labels = c("Population Structure", "Polygenic Background", "Significant Markers")
+      )
+    )
+  
+  ggplot(var_plot_data, aes(x = variable, y = variance * 100, fill = component)) +
+    geom_col(position = "stack") +
+    labs(
+      title = "Variance Partitioning",
+      x = "Environmental Variable",
+      y = "Variance Explained (%)",
+      fill = "Component"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      legend.position = "top"
+    ) +
+    scale_fill_manual(values = c(
+      "Population Structure" = "#3498db",
+      "Polygenic Background" = "#95a5a6",
+      "Significant Markers" = "#e74c3c"
+    ))
+}
+```
+
+## Save Results
+
+```{r save_results}
+cat("\nSaving results...\n")
+
+# Save R workspace
+save(
+  gwas_combined,
+  gwas_analyzed,
+  p_lambda,
+  sig_markers,
+  variance_df,
+  egwas_models,
+  K,
+  snp_info_final,
+  geno_mat_final,
+  env_data,
+  file = file.path(output_dir, "egwas_results.RData")
+)
+cat("  Workspace saved to:", file.path(output_dir, "egwas_results.RData"), "\n")
+
+# Save significant markers
+if (nrow(sig_markers) > 0) {
+  sig_markers_clean <- sig_markers %>%
+    dplyr::select(any_of(c("marker", "chrom", "pos", "model", "variable", 
+                           "p_value", "log10p", "unif_score"))) %>%
+    as.data.frame()
+  
+  write.csv(sig_markers_clean,
+            file = file.path(output_dir, "significant_markers.csv"),
+            row.names = FALSE)
+  cat("  Significant markers saved to:", 
+      file.path(output_dir, "significant_markers.csv"), "\n")
+}
+
+# Save variance explained
+if (nrow(variance_df) > 0) {
+  write.csv(variance_df,
+            file = file.path(output_dir, "variance_explained.csv"),
+            row.names = FALSE)
+  cat("  Variance components saved to:", 
+      file.path(output_dir, "variance_explained.csv"), "\n")
+}
+
+# Save lambda values
+p_lambda_clean <- p_lambda %>%
+  dplyr::select(any_of(c("variable", "model", "lambda", "best_model", "is_best"))) %>%
+  as.data.frame()
+
+write.csv(p_lambda_clean,
+          file = file.path(output_dir, "genomic_inflation_factors.csv"),
+          row.names = FALSE)
+cat("  Lambda values saved to:", 
+    file.path(output_dir, "genomic_inflation_factors.csv"), "\n")
+```
+
+## Final Summary
+
+```{r final_summary}
+cat("\n================================================================================\n")
+cat("ENVIRONMENTAL GWAS COMPLETE!\n")
+cat("================================================================================\n")
+cat("Input files:\n")
+cat("  VCF file:       ", vcf_file, "\n")
+cat("  Environment:    ", env_file, "\n\n")
+
+cat("Final dataset:\n")
+cat("  Samples:        ", nrow(geno_mat_final), "\n")
+cat("  Markers:        ", ncol(geno_mat_final), "\n")
+cat("  Environmental variables:", length(env_vars), "\n\n")
+
+cat("Analysis results:\n")
+cat("  Total GWAS tests:", nrow(gwas_combined), "\n")
+
+if (nrow(sig_markers) > 0) {
+  cat("  Significant markers (FDR <", fdr_threshold, "):", nrow(sig_markers), "\n")
+  
+  sig_summary <- sig_markers %>%
+    group_by(variable) %>%
+    summarise(n_sig = n(), .groups = "drop")
+  
+  cat("\n  Significant markers by variable:\n")
+  for (i in 1:nrow(sig_summary)) {
+    cat("    ", sig_summary$variable[i], ":", sig_summary$n_sig[i], "\n")
+  }
+} else {
+  cat("  No significant markers found at FDR <", fdr_threshold, "\n")
+}
+
+cat("\nOutput directories:\n")
+cat("  Results:", output_dir, "\n")
+cat("  Figures:", figures_dir, "\n")
+cat("================================================================================\n")
+```
+
+## Session Information
+
+```{r session_info}
+sessionInfo()
+```
+
+---
+
+## Interpretation Guide
+
+**Genomic Inflation Factor (λ):**
+
+- **λ ≈ 1**: Good population structure correction
+- **λ > 1**: Inflation (too many false positives) - need more stringent correction
+- **λ < 1**: Deflation (too conservative) - may be losing power
+
+**Model Selection:**
+
+- Choose the model with λ closest to 1 for each environmental variable
+- Model 2 (K + 3 PCs) is typically a good default
+
+**Variance Partitioning:**
+
+- Shows how much environmental variation is explained by:
+  - Population structure (PCs)
+  - Polygenic background (kinship)
+  - Identified significant markers
+
+**Significant Markers:**
+
+- FDR-corrected significance threshold
+- Markers associated with environmental adaptation
+- Can indicate local adaptation or selection
+
+**Next Steps:**
+
+1. Validate significant markers in independent populations
+2. Check for overlap with functional genes
+3. Investigate allele frequency clines across environments
+4. Consider gene ontology enrichment analysis
