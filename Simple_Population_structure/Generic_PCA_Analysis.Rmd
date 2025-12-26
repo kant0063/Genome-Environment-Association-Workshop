@@ -1,0 +1,232 @@
+---
+title: "Population Structure Analysis via PCA"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+This document performs Principal Component Analysis (PCA) on genomic data from a VCF file to visualize population structure.
+
+## Configuration
+
+```{r config}
+# ---------- USER CONFIGURATION ----------
+# Modify these variables for your dataset
+
+# Input VCF file name
+vcf_file <- "your_data.vcf.gz"
+
+# Output GDS file name (will be created)
+gds_file <- "your_data.gds"
+
+# Metadata file (optional - set to NULL if not available)
+# Should contain columns: SampleID and a grouping variable
+metadata_file <- "metadata.csv"
+
+# Name of the grouping column in metadata (e.g., "Population", "Species", "Cluster")
+group_column <- "Population"
+
+# Plot title
+plot_title <- "Population Structure"
+
+# Output file for PCA results
+output_file <- "PCA_results.csv"
+```
+
+## Load Required Libraries
+
+```{r libraries, message=FALSE, warning=FALSE}
+# ---------- 1. Install and Load Required Packages ----------
+library(SNPRelate)
+library(ggplot2)
+```
+
+## Convert VCF to GDS Format
+
+```{r vcf_to_gds}
+# ---------- 2. Convert VCF to GDS ----------
+# This step only needs to be run once per VCF file
+if (!file.exists(gds_file)) {
+  snpgdsVCF2GDS(vcf_file, gds_file, method = "biallelic.only")
+  cat("GDS file created successfully\n")
+} else {
+  cat("GDS file already exists, skipping conversion\n")
+}
+```
+
+## Open GDS File
+
+```{r open_gds}
+# ---------- 3. Open GDS File ----------
+genofile <- snpgdsOpen(gds_file)
+```
+
+## LD Pruning
+
+```{r ld_pruning}
+# ---------- 4. LD Pruning ----------
+# Remove SNPs in linkage disequilibrium to reduce redundancy
+pruned_snp <- snpgdsLDpruning(genofile, autosome.only = FALSE)
+snpset <- unlist(pruned_snp, use.names = FALSE)
+
+cat("Number of SNPs after LD pruning:", length(snpset), "\n")
+```
+
+## Perform PCA
+
+```{r run_pca}
+# ---------- 5. Perform PCA ----------
+pca <- snpgdsPCA(genofile, snp.id = snpset, autosome.only = FALSE)
+
+cat("PCA completed successfully\n")
+cat("Number of principal components:", ncol(pca$eigenvect), "\n")
+```
+
+## Extract PCA Results
+
+```{r extract_pca}
+# ---------- 6. Extract PCA Results ----------
+# Calculate variance explained by each PC
+pc_percent <- pca$varprop * 100
+
+# Create data frame with PCA results
+pca_df <- data.frame(
+  SampleID = pca$sample.id,
+  PC1 = pca$eigenvect[, 1],
+  PC2 = pca$eigenvect[, 2],
+  PC3 = pca$eigenvect[, 3],
+  PC4 = pca$eigenvect[, 4],
+  PC5 = pca$eigenvect[, 5]
+)
+
+# Display variance explained
+cat("\nVariance explained by first 5 PCs:\n")
+for (i in 1:5) {
+  cat(sprintf("PC%d: %.2f%%\n", i, pc_percent[i]))
+}
+```
+
+## Add Metadata (Optional)
+
+```{r add_metadata}
+# ---------- 7. Add Population/Group Labels ----------
+if (!is.null(metadata_file) && file.exists(metadata_file)) {
+  # Read metadata
+  metadata <- read.csv(metadata_file)
+  
+  # Check if required columns exist
+  if (!("SampleID" %in% colnames(metadata))) {
+    stop("Metadata file must contain a 'SampleID' column")
+  }
+  
+  if (!(group_column %in% colnames(metadata))) {
+    stop(paste0("Metadata file must contain a '", group_column, "' column"))
+  }
+  
+  # Merge with PCA data
+  pca_df <- merge(pca_df, metadata[, c("SampleID", group_column)], 
+                  by = "SampleID", all.x = TRUE)
+  
+  # Check for sample ID mismatches
+  n_matched <- sum(!is.na(pca_df[[group_column]]))
+  cat(sprintf("\n%d of %d samples matched with metadata\n", 
+              n_matched, nrow(pca_df)))
+  
+} else {
+  # If no metadata, create a default group
+  cat("\nNo metadata file provided - all samples assigned to single group\n")
+  pca_df$Group <- "All Samples"
+  group_column <- "Group"
+}
+
+head(pca_df)
+```
+
+## Visualize PCA
+
+### PC1 vs PC2
+
+```{r plot_pc12, fig.width=8, fig.height=6}
+# ---------- 8. Plot PCA (PC1 vs PC2) ----------
+ggplot(pca_df, aes(x = PC1, y = PC2, color = .data[[group_column]])) +
+  geom_point(size = 3, alpha = 0.7) +
+  stat_ellipse(type = "norm", level = 0.95, linetype = 2, linewidth = 1) +
+  labs(
+    title = plot_title,
+    x = paste0("PC1 (", round(pc_percent[1], 2), "%)"),
+    y = paste0("PC2 (", round(pc_percent[2], 2), "%)"),
+    color = group_column
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+  )
+```
+
+### PC1 vs PC3
+
+```{r plot_pc13, fig.width=8, fig.height=6}
+# ---------- 9. Plot PCA (PC1 vs PC3) ----------
+ggplot(pca_df, aes(x = PC1, y = PC3, color = .data[[group_column]])) +
+  geom_point(size = 3, alpha = 0.7) +
+  stat_ellipse(type = "norm", level = 0.95, linetype = 2, linewidth = 1) +
+  labs(
+    title = plot_title,
+    x = paste0("PC1 (", round(pc_percent[1], 2), "%)"),
+    y = paste0("PC3 (", round(pc_percent[3], 2), "%)"),
+    color = group_column
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+  )
+```
+
+### PC2 vs PC3
+
+```{r plot_pc23, fig.width=8, fig.height=6}
+# ---------- 10. Plot PCA (PC2 vs PC3) ----------
+ggplot(pca_df, aes(x = PC2, y = PC3, color = .data[[group_column]])) +
+  geom_point(size = 3, alpha = 0.7) +
+  stat_ellipse(type = "norm", level = 0.95, linetype = 2, linewidth = 1) +
+  labs(
+    title = plot_title,
+    x = paste0("PC2 (", round(pc_percent[2], 2), "%)"),
+    y = paste0("PC3 (", round(pc_percent[3], 2), "%)"),
+    color = group_column
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+  )
+```
+
+## Save Results
+
+```{r save_results}
+# ---------- 11. Save PCA Results ----------
+write.csv(pca_df, output_file, row.names = FALSE)
+cat("\nPCA results saved to:", output_file, "\n")
+```
+
+## Close GDS File
+
+```{r close_gds}
+# ---------- 12. Close the GDS File ----------
+snpgdsClose(genofile)
+cat("GDS file closed\n")
+```
+
+## Session Information
+
+```{r session_info}
+sessionInfo()
+```
