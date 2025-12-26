@@ -1,0 +1,815 @@
+---
+title: "Spatial Population Structure Analysis with TESS3"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 12,
+  fig.height = 8,
+  fig.align = 'center'
+)
+```
+
+# Introduction
+
+## What is TESS3?
+
+**TESS3** (Terrain-based Estimation of Spatial Structure) is a spatial population genetics method that estimates ancestry coefficients while accounting for geographic information.
+
+**Key features:**
+
+- **Spatially explicit**: Uses geographic coordinates directly
+- **No prior population assignment**: Infers structure from data
+- **Continuous variation**: Models smooth transitions across space
+- **Visualization**: Generates spatial interpolation maps
+- **K selection**: Cross-validation to determine optimal number of clusters
+
+**Advantages over STRUCTURE/ADMIXTURE:**
+
+- Incorporates spatial information directly
+- Better for continuously distributed populations
+- Produces beautiful spatial maps
+- Faster computation
+- No need to define discrete populations
+
+## Applications
+
+- **Landscape genetics**: Understand gene flow patterns
+- **Conservation**: Identify management units
+- **Biogeography**: Map genetic clines
+- **Invasion biology**: Track introduction routes
+- **Agriculture**: Characterize germplasm structure
+- **Climate adaptation**: Identify locally adapted populations
+
+# Setup
+
+## Load Required Libraries
+
+```{r load-libraries}
+# Load required packages
+library(vcfR)          # VCF file handling
+library(tess3r)        # TESS3 analysis
+library(maps)          # Base R maps
+library(rworldmap)     # World map data
+library(ggplot2)       # Plotting
+library(dplyr)         # Data manipulation
+library(tidyr)         # Data reshaping
+library(patchwork)     # Combine plots
+library(knitr)         # Table formatting
+library(kableExtra)    # Enhanced tables
+
+cat("All required packages loaded successfully\n")
+```
+
+## Set File Paths and Parameters
+
+```{r set-parameters}
+# ==================== INPUT FILES ====================
+VCF_FILE <- "your_genotypes.vcf"                    # Path to VCF file
+COORD_CSV <- "your_coordinates.csv"                 # Path to coordinate CSV
+
+# ==================== COORDINATE COLUMNS ====================
+SAMPLE_ID_COLUMN <- "SampleID"                      # Sample ID column name
+LATITUDE_COLUMN <- "Latitude"                       # Latitude column name
+LONGITUDE_COLUMN <- "Longitude"                     # Longitude column name
+
+# ==================== TESS3 PARAMETERS ====================
+K_VALUES <- 1:7                                     # Range of K values to test
+PLOIDY <- 2                                         # Ploidy level (2 for diploid)
+N_CORES <- 4                                        # Number of CPU cores to use
+
+# ==================== VISUALIZATION PARAMETERS ====================
+# Geographic extent for maps (adjust based on your data)
+MAP_XLIM <- c(-180, 180)                            # Longitude range
+MAP_YLIM <- c(-90, 90)                              # Latitude range
+
+# ==================== OUTPUT OPTIONS ====================
+OUTPUT_PREFIX <- "tess3"                            # Prefix for output files
+OUTPUT_DIR <- "tess3_results"                       # Output directory
+
+# Create output directory
+if (!dir.exists(OUTPUT_DIR)) {
+  dir.create(OUTPUT_DIR, recursive = TRUE)
+}
+
+# Display parameters
+param_table <- data.frame(
+  Parameter = c("VCF File", "Coordinate CSV", "K Values", "Ploidy", "CPU Cores"),
+  Value = c(VCF_FILE, COORD_CSV, paste(range(K_VALUES), collapse = " to "), 
+            PLOIDY, N_CORES)
+)
+
+kable(param_table, caption = "Analysis Parameters") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+# Data Import and Preparation
+
+## Read VCF File
+
+```{r read-vcf}
+cat("Reading VCF file:", VCF_FILE, "\n")
+
+# Check if file exists
+if (!file.exists(VCF_FILE)) {
+  stop("VCF file not found: ", VCF_FILE)
+}
+
+# Read VCF
+vcf <- read.vcfR(VCF_FILE)
+
+cat("VCF loaded successfully\n")
+cat("  SNPs:", nrow(vcf@fix), "\n")
+cat("  Samples:", ncol(vcf@gt) - 1, "\n")
+
+# Extract genotypes as numeric matrix (0, 1, 2 for diploid)
+gt_numeric <- extract.gt(vcf, element = "GT", as.numeric = TRUE)
+
+# Transpose: TESS3 requires samples as rows, SNPs as columns
+genotype <- t(gt_numeric)
+
+cat("  Genotype matrix dimensions (samples x SNPs):", dim(genotype), "\n")
+
+# Get sample names
+sample_names <- rownames(genotype)
+
+# Create VCF summary
+vcf_summary <- data.frame(
+  Metric = c("Total SNPs", "Total Samples", "Missing Genotypes"),
+  Value = c(
+    ncol(genotype),
+    nrow(genotype),
+    paste0(round(100 * sum(is.na(genotype)) / length(genotype), 2), "%")
+  )
+)
+
+kable(vcf_summary, caption = "VCF Data Summary") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## Read Coordinate Data
+
+```{r read-coordinates}
+cat("Reading coordinate data:", COORD_CSV, "\n")
+
+# Check if file exists
+if (!file.exists(COORD_CSV)) {
+  stop("Coordinate CSV file not found: ", COORD_CSV)
+}
+
+# Read CSV
+coordinates <- read.csv(COORD_CSV, header = TRUE, stringsAsFactors = FALSE)
+
+cat("Coordinate data loaded\n")
+cat("  Total samples:", nrow(coordinates), "\n")
+
+# Display first few rows
+kable(head(coordinates), caption = "Coordinate Data Preview") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  scroll_box(width = "100%")
+
+# Check required columns exist
+required_cols <- c(SAMPLE_ID_COLUMN, LATITUDE_COLUMN, LONGITUDE_COLUMN)
+missing_cols <- setdiff(required_cols, colnames(coordinates))
+
+if (length(missing_cols) > 0) {
+  stop("Missing required columns in coordinate CSV: ", 
+       paste(missing_cols, collapse = ", "))
+}
+```
+
+## Match Samples Between VCF and Coordinates
+
+```{r match-samples}
+cat("Matching samples between VCF and coordinate data...\n")
+
+# Get sample IDs from both datasets
+vcf_samples <- sample_names
+coord_samples <- coordinates[[SAMPLE_ID_COLUMN]]
+
+cat("VCF samples:", length(vcf_samples), "\n")
+cat("Coordinate samples:", length(coord_samples), "\n")
+
+# Find common samples
+common_samples <- intersect(vcf_samples, coord_samples)
+
+cat("Common samples:", length(common_samples), "\n")
+
+if (length(common_samples) == 0) {
+  stop("ERROR: No matching samples found!\n",
+       "  VCF samples (first 5): ", paste(head(vcf_samples, 5), collapse = ", "), "\n",
+       "  Coordinate samples (first 5): ", paste(head(coord_samples, 5), collapse = ", "))
+}
+
+# Create matching summary
+match_summary <- data.frame(
+  Category = c("VCF samples", "Coordinate samples", "Matched samples", 
+               "VCF-only", "Coordinates-only"),
+  Count = c(
+    length(vcf_samples),
+    length(coord_samples),
+    length(common_samples),
+    length(vcf_samples) - length(common_samples),
+    length(coord_samples) - length(common_samples)
+  )
+)
+
+kable(match_summary, caption = "Sample Matching Summary") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+# Subset both datasets to common samples
+genotype_matched <- genotype[rownames(genotype) %in% common_samples, ]
+coordinates_matched <- coordinates[coordinates[[SAMPLE_ID_COLUMN]] %in% common_samples, ]
+
+# Ensure same order
+coordinates_matched <- coordinates_matched[match(rownames(genotype_matched), 
+                                                 coordinates_matched[[SAMPLE_ID_COLUMN]]), ]
+
+# Verify alignment
+if (!all(rownames(genotype_matched) == coordinates_matched[[SAMPLE_ID_COLUMN]])) {
+  stop("ERROR: Sample alignment verification failed!")
+}
+
+cat("Sample alignment verified\n")
+```
+
+## Remove Samples with Missing Coordinates
+
+```{r remove-missing-coords}
+cat("Checking for missing coordinates...\n")
+
+# Identify samples with missing lat/long
+coord_cols <- c(LATITUDE_COLUMN, LONGITUDE_COLUMN)
+missing_coords <- which(!complete.cases(coordinates_matched[, coord_cols]))
+
+if (length(missing_coords) > 0) {
+  cat("Removing", length(missing_coords), "samples with missing coordinates\n")
+  cat("Sample indices:", paste(missing_coords, collapse = ", "), "\n")
+  
+  genotype_final <- genotype_matched[-missing_coords, ]
+  coordinates_final <- coordinates_matched[-missing_coords, ]
+} else {
+  cat("No missing coordinates found\n")
+  genotype_final <- genotype_matched
+  coordinates_final <- coordinates_matched
+}
+
+cat("Final dataset:", nrow(genotype_final), "samples\n")
+```
+
+## Impute Missing Genotypes
+
+```{r impute-genotypes}
+cat("Imputing missing genotypes...\n")
+
+# Count missing before imputation
+missing_before <- sum(is.na(genotype_final))
+missing_pct_before <- 100 * missing_before / length(genotype_final)
+
+# Impute missing genotypes with column (SNP) means
+genotype_final <- apply(genotype_final, 2, function(x) {
+  ifelse(is.na(x), mean(x, na.rm = TRUE), x)
+})
+
+# Count missing after imputation
+missing_after <- sum(is.na(genotype_final))
+
+cat("Missing genotypes before imputation:", missing_before, 
+    paste0("(", round(missing_pct_before, 2), "%)"), "\n")
+cat("Missing genotypes after imputation:", missing_after, "\n")
+```
+
+## Prepare Coordinate Matrix
+
+```{r prepare-coords}
+# Extract coordinate matrix for TESS3
+coord_matrix <- as.matrix(coordinates_final[, c(LONGITUDE_COLUMN, LATITUDE_COLUMN)])
+
+# Ensure numeric
+coord_matrix <- apply(coord_matrix, 2, as.numeric)
+
+cat("Final dataset dimensions:\n")
+cat("  Samples:", nrow(genotype_final), "\n")
+cat("  SNPs:", ncol(genotype_final), "\n")
+cat("  Coordinates:", nrow(coord_matrix), "x", ncol(coord_matrix), "\n")
+
+# Display coordinate summary
+coord_summary <- data.frame(
+  Statistic = c("Min Longitude", "Max Longitude", "Min Latitude", "Max Latitude",
+                "Longitude Range", "Latitude Range"),
+  Value = c(
+    round(min(coord_matrix[, 1]), 4),
+    round(max(coord_matrix[, 1]), 4),
+    round(min(coord_matrix[, 2]), 4),
+    round(max(coord_matrix[, 2]), 4),
+    round(max(coord_matrix[, 1]) - min(coord_matrix[, 1]), 4),
+    round(max(coord_matrix[, 2]) - min(coord_matrix[, 2]), 4)
+  )
+)
+
+kable(coord_summary, caption = "Coordinate Summary") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## Visualize Sampling Locations
+
+```{r plot-sampling-locations, fig.width=10, fig.height=6}
+# Create map of sampling locations
+plot(coord_matrix, pch = 19, cex = 0.8, col = "red",
+     xlab = "Longitude (°)", ylab = "Latitude (°)",
+     main = "Sampling Locations")
+maps::map(add = TRUE, interior = TRUE, col = "gray70")
+grid()
+```
+
+# TESS3 Analysis
+
+## Run TESS3 for Multiple K Values
+
+```{r run-tess3}
+cat("Running TESS3 analysis for K =", paste(K_VALUES, collapse = ", "), "...\n")
+cat("This may take several minutes...\n")
+
+# Start timer
+start_time <- Sys.time()
+
+# Run TESS3
+tess3_obj <- tess3(
+  X = genotype_final, 
+  coord = coord_matrix, 
+  K = K_VALUES,
+  method = "projected.ls", 
+  ploidy = PLOIDY, 
+  openMP.core.num = N_CORES
+)
+
+# End timer
+end_time <- Sys.time()
+elapsed <- as.numeric(difftime(end_time, start_time, units = "mins"))
+
+cat("TESS3 analysis complete!\n")
+cat("Elapsed time:", round(elapsed, 2), "minutes\n")
+```
+
+## Extract Cross-Validation Scores
+
+```{r extract-cv}
+cat("Extracting cross-validation scores...\n")
+
+# Extract CV scores
+if (!is.null(tess3_obj$crossvalid)) {
+  cv_scores <- tess3_obj$crossvalid
+} else if (!is.null(tess3_obj$rmse)) {
+  cv_scores <- tess3_obj$rmse
+} else {
+  # Manually extract from each K
+  cv_scores <- sapply(K_VALUES, function(k) {
+    tess3_obj[[paste0("K", k)]]$crossvalid
+  })
+}
+
+# Create CV results table
+cv_table <- data.frame(
+  K = K_VALUES,
+  CV_Score = cv_scores
+)
+
+kable(cv_table, digits = 4, caption = "Cross-Validation Scores") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+# Determine optimal K (minimum CV score)
+optimal_K <- K_VALUES[which.min(cv_scores)]
+cat("\nOptimal K (minimum CV):", optimal_K, "\n")
+```
+
+## Plot Cross-Validation Scores
+
+```{r plot-cv, fig.width=8, fig.height=6}
+# Plot CV scores
+plot(K_VALUES, cv_scores, 
+     type = "b", pch = 19, col = "blue", lwd = 2,
+     xlab = "Number of Ancestral Populations (K)",
+     ylab = "Cross-Validation Score",
+     main = "TESS3 Cross-Validation Scores")
+
+# Mark optimal K
+points(optimal_K, cv_scores[which.min(cv_scores)], 
+       pch = 19, col = "red", cex = 2)
+text(optimal_K, cv_scores[which.min(cv_scores)], 
+     paste("Optimal K =", optimal_K), 
+     pos = 3, col = "red", font = 2)
+grid()
+```
+
+# Visualization: Ancestry Plots
+
+## STRUCTURE-like Bar Plots
+
+```{r structure-barplots, fig.width=14, fig.height=18}
+# Define color palette
+my.colors <- c("tomato", "orange", "purple", "olivedrab", "gold", 
+               "lightblue", "grey", "pink", "brown")
+my.palette <- CreatePalette(my.colors, 9)
+
+# Set up multi-panel plot
+par(mfrow = c(3, 2), mar = c(4, 4, 3, 1))
+
+# Plot for each K value (skip K=1)
+for (K in K_VALUES[K_VALUES > 1]) {
+  # Get Q matrix
+  q.matrix <- qmatrix(tess3_obj, K = K)
+  
+  # Create barplot
+  barplot(q.matrix, 
+          border = NA, 
+          space = 0, 
+          xlab = "Individuals", 
+          ylab = "Ancestry Proportions", 
+          main = paste("Ancestry Coefficients (K =", K, ")"),
+          col = my.palette[1:K],
+          las = 1)
+}
+
+# Reset plotting parameters
+par(mfrow = c(1, 1))
+```
+
+## Individual Barplots (High Resolution)
+
+```{r individual-barplots, eval=FALSE}
+# Save individual high-resolution plots for each K
+for (K in K_VALUES[K_VALUES > 1]) {
+  
+  filename <- file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_barplot_K", K, ".png"))
+  
+  png(filename, width = 12, height = 6, units = "in", res = 300)
+  
+  q.matrix <- qmatrix(tess3_obj, K = K)
+  
+  barplot(q.matrix, 
+          border = NA, 
+          space = 0, 
+          xlab = "Individuals", 
+          ylab = "Ancestry Proportions", 
+          main = paste("Ancestry Coefficients (K =", K, ")"),
+          col = my.palette[1:K],
+          las = 1,
+          cex.main = 1.5,
+          cex.lab = 1.3,
+          cex.axis = 1.2)
+  
+  dev.off()
+  
+  cat("Saved:", filename, "\n")
+}
+```
+
+# Visualization: Spatial Maps
+
+## Base R Spatial Interpolation Maps
+
+```{r spatial-maps-base, fig.width=12, fig.height=16}
+# Set up multi-panel plot
+par(mfrow = c(3, 2), mar = c(4, 4, 3, 2))
+
+# Plot for each K value (skip K=1)
+for (K in K_VALUES[K_VALUES > 1]) {
+  q.matrix <- qmatrix(tess3_obj, K = K)
+  
+  plot(q.matrix, coord_matrix, 
+       method = "map.max", 
+       interpol = FieldsKrigModel(10),
+       main = paste("Spatial Ancestry (K =", K, ")"),
+       xlab = "Longitude", 
+       ylab = "Latitude",
+       resolution = c(300, 300), 
+       cex = 0.4,
+       col.palette = my.palette)
+}
+
+# Reset plotting parameters
+par(mfrow = c(1, 1))
+```
+
+## ggplot2 Spatial Maps
+
+```{r spatial-maps-ggplot, fig.width=14, fig.height=18}
+# Get world map polygon
+map.polygon <- getMap(resolution = "low")
+
+# Create list to store plots
+plot_list <- list()
+
+# Determine map extent based on data
+lon_range <- range(coord_matrix[, 1])
+lat_range <- range(coord_matrix[, 2])
+
+# Add buffer
+lon_buffer <- diff(lon_range) * 0.2
+lat_buffer <- diff(lat_range) * 0.2
+
+xlim_map <- c(lon_range[1] - lon_buffer, lon_range[2] + lon_buffer)
+ylim_map <- c(lat_range[1] - lat_buffer, lat_range[2] + lat_buffer)
+
+# Create plots for each K
+for (K in K_VALUES[K_VALUES > 1]) {
+  # Extract Q-matrix
+  q.matrix <- qmatrix(tess3_obj, K = K)
+  
+  # Create map using ggtess3Q
+  pl <- ggtess3Q(q.matrix, coord_matrix, map.polygon = map.polygon)
+  
+  # Customize plot
+  p <- pl +
+    geom_path(data = map.polygon, aes(x = long, y = lat, group = group)) +
+    xlim(xlim_map) +
+    ylim(ylim_map) +
+    coord_equal() +
+    geom_point(data = data.frame(
+                 Longitude = coord_matrix[, 1], 
+                 Latitude = coord_matrix[, 2]),
+               aes(x = Longitude, y = Latitude),
+               size = 1, color = "black") +
+    xlab("Longitude") +
+    ylab("Latitude") +
+    theme_bw() +
+    ggtitle(paste("Spatial Ancestry (K =", K, ")")) +
+    theme(
+      plot.title = element_text(size = 14, hjust = 0.5, face = "bold"),
+      axis.title = element_text(size = 11),
+      axis.text = element_text(size = 10),
+      legend.title = element_text(size = 10),
+      legend.text = element_text(size = 9)
+    )
+  
+  # Store plot
+  plot_list[[paste0("K", K)]] <- p
+}
+
+# Combine all plots
+combined_plot <- wrap_plots(plot_list, ncol = 2)
+print(combined_plot)
+```
+
+# Extract and Save Q-Matrices
+
+```{r save-qmatrices}
+cat("Saving Q-matrices...\n")
+
+# Save Q-matrix for each K
+for (K in K_VALUES[K_VALUES > 1]) {
+  q.matrix <- qmatrix(tess3_obj, K = K)
+  
+  # Create data frame with sample names
+  q_df <- data.frame(
+    Sample = rownames(genotype_final),
+    q.matrix
+  )
+  colnames(q_df) <- c("Sample", paste0("Cluster_", 1:K))
+  
+  # Add coordinates
+  q_df$Longitude <- coord_matrix[, 1]
+  q_df$Latitude <- coord_matrix[, 2]
+  
+  # Save to CSV
+  filename <- file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_qmatrix_K", K, ".csv"))
+  write.csv(q_df, filename, row.names = FALSE)
+  
+  cat("Saved Q-matrix for K =", K, "\n")
+}
+```
+
+# Save Results
+
+```{r save-results}
+cat("Saving results to disk...\n")
+
+# Save combined barplot
+png(file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_barplots_combined.png")), 
+    width = 14, height = 18, units = "in", res = 300)
+
+par(mfrow = c(3, 2), mar = c(4, 4, 3, 1))
+
+for (K in K_VALUES[K_VALUES > 1]) {
+  q.matrix <- qmatrix(tess3_obj, K = K)
+  
+  barplot(q.matrix, 
+          border = NA, 
+          space = 0, 
+          xlab = "Individuals", 
+          ylab = "Ancestry Proportions", 
+          main = paste("Ancestry Coefficients (K =", K, ")"),
+          col = my.palette[1:K],
+          las = 1)
+}
+
+par(mfrow = c(1, 1))
+dev.off()
+
+cat("Saved combined barplot\n")
+
+# Save combined spatial maps (base R)
+png(file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_spatial_maps_baseR.png")), 
+    width = 12, height = 16, units = "in", res = 300)
+
+par(mfrow = c(3, 2), mar = c(4, 4, 3, 2))
+
+for (K in K_VALUES[K_VALUES > 1]) {
+  q.matrix <- qmatrix(tess3_obj, K = K)
+  
+  plot(q.matrix, coord_matrix, 
+       method = "map.max", 
+       interpol = FieldsKrigModel(10),
+       main = paste("Spatial Ancestry (K =", K, ")"),
+       xlab = "Longitude", ylab = "Latitude",
+       resolution = c(300, 300), cex = 0.4,
+       col.palette = my.palette)
+}
+
+par(mfrow = c(1, 1))
+dev.off()
+
+cat("Saved spatial maps (base R)\n")
+
+# Save combined spatial maps (ggplot)
+ggsave(file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_spatial_maps_ggplot.png")), 
+       combined_plot, 
+       width = 14, height = 18, dpi = 300)
+
+cat("Saved spatial maps (ggplot)\n")
+
+# Save cross-validation results
+write.csv(cv_table, 
+          file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_cross_validation.csv")), 
+          row.names = FALSE)
+
+cat("Saved cross-validation results\n")
+
+# Save summary
+summary_data <- data.frame(
+  Metric = c("Total Samples", "Total SNPs", "Optimal K", "Min CV Score"),
+  Value = c(
+    nrow(genotype_final),
+    ncol(genotype_final),
+    optimal_K,
+    round(min(cv_scores), 4)
+  )
+)
+
+write.csv(summary_data, 
+          file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_summary.csv")), 
+          row.names = FALSE)
+
+cat("Saved analysis summary\n")
+
+cat("\nAll results saved successfully!\n")
+cat("Output directory:", OUTPUT_DIR, "\n")
+```
+
+# Interpretation Guide
+
+## Understanding TESS3 Results
+
+### Cross-Validation Scores
+
+**Lower CV score = better model fit**
+
+- **Elbow method**: Look for where CV score plateaus
+- **Minimum CV**: Typically indicates optimal K
+- **Biological meaning**: Consider biological interpretation alongside statistics
+
+### Ancestry Coefficients (Q-matrix)
+
+**Each row = one individual**
+**Each column = one ancestry cluster**
+**Values sum to 1** across clusters for each individual
+
+**Interpretation:**
+
+- **Pure ancestry** (e.g., 0.9, 0.05, 0.05): Individual mainly from one cluster
+- **Admixed** (e.g., 0.4, 0.3, 0.3): Individual has mixed ancestry
+- **Recent admixture**: Sharp transitions in geographic space
+- **Ancient admixture**: Broad clines
+
+### Spatial Maps
+
+**Color patterns indicate:**
+
+- **Distinct regions**: Sharp color boundaries = population differentiation
+- **Gradual transitions**: Color clines = isolation by distance
+- **Patchwork**: Complex admixture patterns
+- **Geographic barriers**: Correspond to mountains, rivers, etc.
+
+### Choosing K
+
+**Consider multiple lines of evidence:**
+
+1. **Cross-validation score**: Minimum value
+2. **Biological knowledge**: Known populations/subspecies
+3. **Geographic structure**: Match to landscape features
+4. **Stability**: Consistent results across runs
+5. **Interpretation**: Meaningful biological clusters
+
+**Common patterns:**
+
+- **K = 2**: Often captures major geographic split
+- **K = 3-5**: Finer-scale regional structure
+- **K > 5**: May reveal fine-scale or family structure
+
+## Biological Interpretation
+
+### Population Structure
+
+**Strong structure (distinct clusters):**
+- Limited gene flow between regions
+- Geographic barriers to dispersal
+- Different selective environments
+- Long-term isolation
+
+**Weak structure (gradual clines):**
+- Continuous gene flow
+- Isolation by distance
+- No major barriers
+- Recent colonization
+
+### Gene Flow Patterns
+
+**Look for:**
+
+- **Source populations**: High ancestry in one cluster
+- **Admixture zones**: High mixing between clusters
+- **Migration routes**: Gradual changes along corridors
+- **Barriers**: Sharp transitions at boundaries
+
+### Management Implications
+
+**For conservation:**
+
+- **Genetic units**: Distinct clusters may warrant separate management
+- **Connectivity**: Admixture zones indicate gene flow corridors
+- **Priorities**: Unique clusters (high differentiation) are priorities
+- **Translocation**: Avoid mixing divergent genetic units
+
+**For breeding:**
+
+- **Diversity**: Sample across all major clusters
+- **Heterosis**: Cross individuals from different clusters
+- **Local adaptation**: Consider cluster-environment associations
+
+## Next Steps
+
+1. **Validate with other methods**
+   - Compare with STRUCTURE/ADMIXTURE
+   - Run PCA for comparison
+   - Calculate pairwise FST
+
+2. **Environmental associations**
+   - Test cluster-environment correlations
+   - Run RDA or LFMM
+   - Identify adaptive loci
+
+3. **Demographic history**
+   - Test for isolation by distance
+   - Estimate migration rates
+   - Model demographic scenarios
+
+4. **Functional analysis**
+   - Annotate differentiated loci
+   - Test for selection signatures
+   - Link to phenotypes
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
+
+# References
+
+1. Caye, K., Deist, T. M., Martins, H., Michel, O., & François, O. (2016). TESS3: Fast inference of spatial population structure and genome scans for selection. *Molecular Ecology Resources*, 16(2), 540-548.
+
+2. Frichot, E., Mathieu, F., Trouillon, T., Bouchard, G., & François, O. (2014). Fast and efficient estimation of individual ancestry coefficients. *Genetics*, 196(4), 973-983.
+
+3. Guillot, G., Mortier, F., & Estoup, A. (2005). GENELAND: a computer package for landscape genetics. *Molecular Ecology Notes*, 5(3), 712-715.
+
+---
+
+**Analysis completed:** `r Sys.time()`
