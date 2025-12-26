@@ -1,0 +1,828 @@
+---
+title: "Redundancy Analysis (RDA) for Genomic Data"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 8,
+  fig.align = 'center'
+)
+```
+
+# Introduction
+
+## What is RDA?
+
+Redundancy Analysis (RDA) is a constrained ordination method that identifies associations between genomic variation (from SNP data) and environmental or climate variables. 
+
+**Key applications:**
+
+- Identifies relationships between genomic variation and environmental predictors
+- Detects candidate loci potentially under environmental selection
+- Provides visualization of genotype-environment associations
+- Tests statistical significance through permutation tests
+
+## When to Use RDA
+
+Use RDA when you have:
+
+- Genomic data (SNPs) from multiple individuals/populations
+- Environmental or climate data for sample collection locations
+- Interest in identifying adaptive genetic variation
+- Questions about genotype-environment associations
+
+# Setup
+
+## Install and Load Required Packages
+
+```{r load-packages}
+# Install and load required packages
+required_packages <- c("vcfR", "vegan", "ggplot2", "dplyr", "corrplot", "knitr", "kableExtra")
+
+for (pkg in required_packages) {
+  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+    library(pkg, character.only = TRUE)
+  }
+}
+```
+
+**Package purposes:**
+
+- `vcfR`: Reading and handling VCF files
+- `vegan`: Performing RDA and multivariate analyses
+- `ggplot2`: Creating publication-quality plots
+- `dplyr`: Data manipulation
+- `corrplot`: Visualizing correlation matrices
+- `knitr` & `kableExtra`: Creating formatted tables
+
+## Set Analysis Parameters
+
+```{r set-parameters}
+# === FILE INPUTS ===
+VCF_FILE <- "your_genotypes.vcf"
+CLIMATE_CSV <- "your_environmental_data.csv"
+SAMPLE_ID_COLUMN <- "SampleID"
+EXCLUDE_COLUMNS <- c("SampleID", "Longitude", "Latitude")
+
+# === ANALYSIS PARAMETERS ===
+CORRELATION_CUTOFF <- 0.9        # Remove highly correlated variables
+OUTLIER_QUANTILE <- 0.999        # 99.9th percentile for candidate SNPs
+N_PERMUTATIONS <- 100            # Permutations for significance testing
+MAX_MISSING_DATA <- 0.30         # Maximum 30% missing data per SNP
+
+# === OUTPUT OPTIONS ===
+OUTPUT_PREFIX <- "rda"
+OUTPUT_DIR <- "rda_results"
+
+# Create output directory
+if (!dir.exists(OUTPUT_DIR)) {
+  dir.create(OUTPUT_DIR)
+}
+```
+
+# Input Data Requirements
+
+## VCF File (Genotype Data)
+
+Your VCF file should contain:
+
+- SNP genotype calls for all samples
+- Chromosome and position information
+- Quality-filtered SNPs
+
+**Example VCF structure:**
+```
+#CHROM  POS     ID      REF     ALT     QUAL    FILTER  INFO    FORMAT  Sample1 Sample2 Sample3
+Chr1    1000    .       A       G       99      PASS    .       GT      0/0     0/1     1/1
+Chr1    2000    .       C       T       99      PASS    .       GT      0/1     0/1     0/0
+```
+
+## Environmental/Climate CSV File
+
+The CSV file must include:
+
+- **First column**: Sample IDs (must match VCF sample names)
+- **Optional columns**: Longitude, Latitude (will be excluded from analysis)
+- **Remaining columns**: Environmental/climate variables (continuous)
+
+**Example CSV structure:**
+```
+SampleID,Longitude,Latitude,Temperature,Precipitation,Elevation
+Sample1,-120.5,45.2,15.3,800,1200
+Sample2,-118.3,44.8,16.1,750,950
+Sample3,-122.1,46.5,14.2,900,1450
+```
+
+# Helper Functions
+
+```{r helper-functions}
+# Function to identify highly correlated variables
+identify_highly_correlated <- function(cor_matrix, cutoff = 0.9) {
+  upper_tri <- upper.tri(cor_matrix)
+  high_cor_pairs <- which(abs(cor_matrix) > cutoff & upper_tri, arr.ind = TRUE)
+  
+  if (nrow(high_cor_pairs) == 0) {
+    return(integer(0))
+  }
+  
+  vars_to_remove <- c()
+  
+  for (i in 1:nrow(high_cor_pairs)) {
+    var1 <- high_cor_pairs[i, 1]
+    var2 <- high_cor_pairs[i, 2]
+    
+    mean_cor_var1 <- mean(abs(cor_matrix[var1, -var1]), na.rm = TRUE)
+    mean_cor_var2 <- mean(abs(cor_matrix[var2, -var2]), na.rm = TRUE)
+    
+    if (mean_cor_var1 > mean_cor_var2) {
+      vars_to_remove <- c(vars_to_remove, var1)
+    } else {
+      vars_to_remove <- c(vars_to_remove, var2)
+    }
+  }
+  
+  return(unique(vars_to_remove))
+}
+```
+
+# Data Import and Processing
+
+## Read VCF File
+
+```{r read-vcf}
+cat("Step 1: Reading VCF file...\n")
+
+# Check if file exists
+if (!file.exists(VCF_FILE)) {
+  stop("Error: VCF file not found at: ", VCF_FILE)
+}
+
+# Read VCF
+vcf <- read.vcfR(VCF_FILE)
+
+cat("  - Loaded", nrow(vcf@fix), "SNPs from", ncol(vcf@gt) - 1, "samples\n")
+```
+
+## Extract Genotype Matrix
+
+```{r extract-genotypes}
+cat("Step 2: Extracting genotype data...\n")
+
+# Extract numeric genotype matrix
+gt_numeric <- extract.gt(vcf, element = "GT", as.numeric = TRUE)
+
+cat("  - Genotype matrix dimensions:", nrow(gt_numeric), "SNPs x", 
+    ncol(gt_numeric), "samples\n")
+```
+
+## Filter SNPs by Missing Data
+
+```{r filter-snps}
+cat("Step 3: Filtering SNPs by missing data threshold...\n")
+cat("  - Original SNPs:", nrow(gt_numeric), "\n")
+
+# Calculate missing data proportion per SNP
+missing_per_snp <- rowSums(is.na(gt_numeric))
+missing_proportion <- missing_per_snp / ncol(gt_numeric)
+
+# Filter SNPs
+snps_pass_filter <- missing_proportion <= MAX_MISSING_DATA
+
+gt_numeric <- gt_numeric[snps_pass_filter, , drop = FALSE]
+vcf@fix <- vcf@fix[snps_pass_filter, , drop = FALSE]
+vcf@gt <- vcf@gt[snps_pass_filter, , drop = FALSE]
+
+cat("  - Maximum missing data allowed:", MAX_MISSING_DATA * 100, "%\n")
+cat("  - SNPs passing filter (≤", MAX_MISSING_DATA * 100, "% missing):", 
+    sum(snps_pass_filter), "\n")
+cat("  - SNPs removed (>", MAX_MISSING_DATA * 100, "% missing):", 
+    sum(!snps_pass_filter), "\n")
+cat("  - Retained", nrow(gt_numeric), "SNPs\n")
+cat("  - Average missing data in retained SNPs:", 
+    round(mean(rowSums(is.na(gt_numeric)) / ncol(gt_numeric)) * 100, 2), "%\n")
+```
+
+## Read Environmental Data
+
+```{r read-environmental}
+cat("Step 4: Reading climate/environmental data...\n")
+
+# Check if file exists
+if (!file.exists(CLIMATE_CSV)) {
+  stop("Error: Climate CSV file not found at: ", CLIMATE_CSV)
+}
+
+# Read environmental data
+env_data <- read.csv(CLIMATE_CSV, header = TRUE, stringsAsFactors = FALSE)
+
+cat("  - Loaded data for", nrow(env_data), "samples with", ncol(env_data), "columns\n")
+
+# Validate that sample ID column exists
+if (!SAMPLE_ID_COLUMN %in% colnames(env_data)) {
+  stop("Error: Sample ID column '", SAMPLE_ID_COLUMN, "' not found in CSV file")
+}
+
+# Display first few rows
+kable(head(env_data, 5), caption = "First 5 rows of environmental data") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## Match Samples Between VCF and Environmental Data
+
+```{r match-samples}
+cat("Step 5: Matching samples between VCF and climate data...\n")
+
+vcf_samples <- colnames(gt_numeric)
+csv_samples <- env_data[[SAMPLE_ID_COLUMN]]
+
+cat("  - VCF samples (first 5):", paste(head(vcf_samples, 5), collapse = ", "), "\n")
+cat("  - CSV samples (first 5):", paste(head(csv_samples, 5), collapse = ", "), "\n\n")
+
+# Find common samples
+common_samples <- intersect(vcf_samples, csv_samples)
+
+cat("  - Found", length(common_samples), "samples with both genetic and environmental data\n")
+cat("  - VCF-only samples:", length(vcf_samples) - length(common_samples), "\n")
+cat("  - CSV-only samples:", length(csv_samples) - length(common_samples), "\n")
+
+# Subset to common samples
+gt_matched <- gt_numeric[, common_samples, drop = FALSE]
+env_matched <- env_data[match(common_samples, csv_samples), ]
+
+cat("  - Final dataset:", length(common_samples), "samples x", nrow(gt_matched), "SNPs\n")
+```
+
+## Prepare Environmental Variables
+
+```{r prepare-env}
+cat("Step 6: Preparing environmental variables...\n")
+
+# Extract environmental variables (exclude metadata columns)
+env_vars <- env_matched[, !colnames(env_matched) %in% EXCLUDE_COLUMNS, drop = FALSE]
+
+# Convert to numeric
+env_vars <- as.data.frame(lapply(env_vars, as.numeric))
+rownames(env_vars) <- common_samples
+
+cat("  - Initial environmental variables:", ncol(env_vars), "\n")
+
+# Check for missing data
+missing_by_var <- colSums(is.na(env_vars)) / nrow(env_vars)
+cat("  - Variables with missing data:\n")
+if (any(missing_by_var > 0)) {
+  print(round(missing_by_var[missing_by_var > 0] * 100, 2))
+}
+
+# Remove variables with too much missing data
+missing_threshold <- 0.1  # 10%
+env_vars <- env_vars[, missing_by_var <= missing_threshold, drop = FALSE]
+
+cat("  - Retained", ncol(env_vars), "variables after removing those with >10% missing data\n")
+
+# Display summary statistics
+kable(
+  data.frame(
+    Variable = colnames(env_vars),
+    Mean = round(colMeans(env_vars, na.rm = TRUE), 2),
+    SD = round(apply(env_vars, 2, sd, na.rm = TRUE), 2),
+    Min = round(apply(env_vars, 2, min, na.rm = TRUE), 2),
+    Max = round(apply(env_vars, 2, max, na.rm = TRUE), 2),
+    Missing_pct = round(colSums(is.na(env_vars)) / nrow(env_vars) * 100, 2)
+  ),
+  caption = "Summary statistics for environmental variables"
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## Check for Multicollinearity
+
+```{r check-correlation}
+cat("Step 7: Checking for multicollinearity...\n")
+
+# Calculate correlation matrix
+env_cor <- cor(env_vars, use = "complete.obs")
+
+# Visualize correlations
+corrplot(env_cor, method = "color", type = "upper", 
+         tl.col = "black", tl.srt = 45, 
+         title = "Environmental Variable Correlations (Before Filtering)",
+         mar = c(0, 0, 2, 0), addCoef.col = "black", number.cex = 0.7)
+
+# Identify highly correlated variables
+vars_to_remove <- identify_highly_correlated(env_cor, CORRELATION_CUTOFF)
+
+if (length(vars_to_remove) > 0) {
+  cat("  - Found", length(vars_to_remove), "highly correlated variables to remove:\n")
+  cat("   ", colnames(env_vars)[vars_to_remove], "\n")
+  env_vars_final <- env_vars[, -vars_to_remove, drop = FALSE]
+} else {
+  cat("  - No highly correlated variables found\n")
+  env_vars_final <- env_vars
+}
+
+cat("  - Retained", ncol(env_vars_final), "environmental variables for RDA\n")
+
+# Visualize final correlations
+if (ncol(env_vars_final) > 1) {
+  env_cor_final <- cor(env_vars_final, use = "complete.obs")
+  corrplot(env_cor_final, method = "color", type = "upper", 
+           tl.col = "black", tl.srt = 45, 
+           title = "Environmental Variable Correlations (After Filtering)",
+           mar = c(0, 0, 2, 0), addCoef.col = "black", number.cex = 0.7)
+}
+```
+
+## Scale Data for RDA
+
+```{r scale-data}
+cat("Step 8: Scaling data for RDA...\n")
+
+# Scale environmental variables (mean = 0, sd = 1)
+env_vars_scaled <- scale(env_vars_final, center = TRUE, scale = TRUE)
+
+# Prepare genotype data
+genotype_data <- t(gt_matched)  # Transpose: samples as rows, SNPs as columns
+
+# Impute missing genotypes with mean
+genotype_data[is.na(genotype_data)] <- mean(genotype_data, na.rm = TRUE)
+
+# Ensure sample order matches between genotype and environmental data
+genotype_data <- genotype_data[match(rownames(env_vars_scaled), rownames(genotype_data)), ]
+
+cat("  - Genotype matrix:", nrow(genotype_data), "samples x", 
+    ncol(genotype_data), "SNPs\n")
+cat("  - Environmental matrix:", nrow(env_vars_scaled), "samples x", 
+    ncol(env_vars_scaled), "variables\n")
+```
+
+# Redundancy Analysis (RDA)
+
+## Run RDA
+
+```{r run-rda}
+cat("Step 9: Running RDA...\n")
+
+# Perform RDA
+rda_result <- rda(genotype_data ~ ., data = as.data.frame(env_vars_scaled))
+
+# Print summary
+cat("\n=== RDA Summary ===\n")
+summary(rda_result)
+```
+
+## Test Significance
+
+```{r test-significance}
+cat("Step 10: Testing significance with permutation tests...\n")
+
+# Overall model significance
+anova_overall <- anova.cca(rda_result, permutations = N_PERMUTATIONS)
+
+# Axis significance
+anova_axes <- anova.cca(rda_result, by = "axis", permutations = N_PERMUTATIONS)
+
+# Individual variable significance
+anova_terms <- anova.cca(rda_result, by = "terms", permutations = N_PERMUTATIONS)
+```
+
+### Overall Model Significance
+
+```{r show-overall}
+kable(anova_overall, caption = "Overall RDA Model Significance") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+### Axis Significance
+
+```{r show-axes}
+kable(anova_axes, caption = "RDA Axis Significance") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+### Environmental Variable Significance
+
+```{r show-terms}
+kable(anova_terms, caption = "Environmental Variable Significance") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## Calculate Variance Explained
+
+```{r variance-explained}
+cat("Step 11: Calculating variance components...\n")
+
+# Extract variance components
+total_var <- rda_result$tot.chi
+constrained_var <- rda_result$CCA$tot.chi
+unconstrained_var <- rda_result$CA$tot.chi
+var_explained <- constrained_var / total_var
+
+# Variance per axis
+eigenvalues <- rda_result$CCA$eig
+axis_var <- (eigenvalues / total_var) * 100
+
+# Create summary table
+variance_table <- data.frame(
+  Component = c("Total Variance", "Constrained Variance", 
+                "Unconstrained Variance", "Proportion Explained"),
+  Value = c(
+    round(total_var, 2),
+    round(constrained_var, 2), 
+    round(unconstrained_var, 2),
+    paste0(round(var_explained * 100, 2), "%")
+  )
+)
+
+kable(variance_table, caption = "RDA Variance Components") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+# Axis variance
+axis_variance_table <- data.frame(
+  Axis = paste0("RDA", 1:min(5, length(axis_var))),
+  Variance_pct = round(axis_var[1:min(5, length(axis_var))], 2)
+)
+
+kable(axis_variance_table, caption = "Variance Explained by RDA Axes") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+# Visualization
+
+## RDA Biplot
+
+```{r rda-biplot, fig.width=10, fig.height=8}
+cat("Step 12: Creating RDA biplot...\n")
+
+# Extract sample scores
+sample_scores <- scores(rda_result, choices = 1:2, display = "sites", scaling = 1)
+rda_df <- data.frame(
+  Sample = rownames(sample_scores),
+  RDA1 = sample_scores[, 1],
+  RDA2 = sample_scores[, 2]
+)
+
+# Extract environmental variable loadings
+env_scores <- scores(rda_result, choices = 1:2, display = "bp", scaling = 1)
+env_arrows <- data.frame(
+  Variable = rownames(env_scores),
+  RDA1 = env_scores[, 1],
+  RDA2 = env_scores[, 2]
+)
+
+# Create biplot
+rda_plot <- ggplot(rda_df, aes(x = RDA1, y = RDA2)) +
+  geom_point(size = 2.5, alpha = 0.7, color = "steelblue") +
+  geom_segment(data = env_arrows, 
+               aes(x = 0, y = 0, xend = RDA1 * 3, yend = RDA2 * 3),
+               arrow = arrow(length = unit(0.3, "cm")), 
+               color = "red", size = 1, alpha = 0.8) +
+  geom_text(data = env_arrows, 
+            aes(x = RDA1 * 3.2, y = RDA2 * 3.2, label = Variable),
+            color = "black", size = 3.5, fontface = "bold") +
+  labs(
+    title = "RDA Biplot: Genomic Variation Constrained by Environment",
+    subtitle = paste0("Total variance explained: ", round(var_explained * 100, 2), "%"),
+    x = paste0("RDA1 (", round(axis_var[1], 2), "%)"),
+    y = paste0("RDA2 (", round(axis_var[2], 2), "%)")
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 14),
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 14)
+  ) +
+  coord_fixed()
+
+print(rda_plot)
+```
+
+## RDA Biplot Colored by Environmental Variable
+
+```{r rda-biplot-colored, fig.width=10, fig.height=8}
+# Create biplot colored by first environmental variable
+if (ncol(env_vars_final) > 0) {
+  first_env_var <- colnames(env_vars_final)[1]
+  rda_df_colored <- cbind(rda_df, 
+                          env_vars_final[match(rda_df$Sample, rownames(env_vars_final)), , drop = FALSE])
+  
+  rda_plot_colored <- ggplot(rda_df_colored, aes(x = RDA1, y = RDA2)) +
+    geom_point(aes_string(color = first_env_var), size = 2.5, alpha = 0.8) +
+    geom_segment(data = env_arrows, 
+                 aes(x = 0, y = 0, xend = RDA1 * 3, yend = RDA2 * 3),
+                 arrow = arrow(length = unit(0.3, "cm")), 
+                 color = "black", size = 1, alpha = 0.8) +
+    geom_text(data = env_arrows, 
+              aes(x = RDA1 * 3.2, y = RDA2 * 3.2, label = Variable),
+              color = "black", size = 3.5, fontface = "bold") +
+    scale_color_gradient(low = "blue", high = "red") +
+    labs(
+      title = paste("RDA Biplot Colored by", first_env_var),
+      subtitle = paste0("Total variance explained: ", round(var_explained * 100, 2), "%"),
+      x = paste0("RDA1 (", round(axis_var[1], 2), "%)"),
+      y = paste0("RDA2 (", round(axis_var[2], 2), "%)")
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5, size = 14),
+      axis.text = element_text(size = 12),
+      axis.title = element_text(size = 14),
+      legend.position = "bottom"
+    ) +
+    coord_fixed()
+  
+  print(rda_plot_colored)
+}
+```
+
+# Candidate SNP Detection
+
+## Identify Outlier SNPs
+
+```{r identify-outliers}
+cat("Step 13: Identifying candidate SNPs using Mahalanobis distance...\n")
+
+# Extract SNP loadings
+species_scores <- scores(rda_result, choices = 1:2, display = "species", scaling = 1)
+loadings_subset <- species_scores[, 1:2]
+
+# Calculate Mahalanobis distances
+maha_dist <- mahalanobis(loadings_subset, 
+                         center = colMeans(loadings_subset), 
+                         cov = cov(loadings_subset))
+
+# Identify outliers
+outlier_threshold <- quantile(maha_dist, OUTLIER_QUANTILE)
+outlier_snps <- which(maha_dist > outlier_threshold)
+
+cat("  - Identified", length(outlier_snps), "candidate SNPs\n")
+cat("  - Outlier threshold (", OUTLIER_QUANTILE * 100, "th percentile): ", 
+    round(outlier_threshold, 3), "\n", sep = "")
+
+# Create outlier data frame
+outlier_df <- data.frame(
+  SNP_index = outlier_snps,
+  RDA1_loading = species_scores[outlier_snps, 1],
+  RDA2_loading = species_scores[outlier_snps, 2],
+  Mahalanobis_distance = maha_dist[outlier_snps],
+  chromosome = vcf@fix[outlier_snps, "CHROM"],
+  position = as.numeric(vcf@fix[outlier_snps, "POS"])
+)
+
+# Display top candidates
+kable(head(outlier_df[order(-outlier_df$Mahalanobis_distance), ], 10),
+      caption = "Top 10 Candidate SNPs by Mahalanobis Distance",
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## SNP Loading Plot
+
+```{r snp-loadings, fig.width=10, fig.height=8}
+# Create loading data frame
+loading_df <- data.frame(
+  SNP = 1:nrow(species_scores),
+  RDA1 = species_scores[, 1],
+  RDA2 = species_scores[, 2],
+  Outlier = 1:nrow(species_scores) %in% outlier_snps
+)
+
+# Create loading plot
+loading_plot <- ggplot(loading_df, aes(x = RDA1, y = RDA2)) +
+  geom_point(aes(color = Outlier), size = 1, alpha = 0.6) +
+  scale_color_manual(values = c("gray70", "red"), 
+                     labels = c("Background SNPs", "Candidate SNPs")) +
+  labs(
+    title = "SNP Loadings on RDA Axes",
+    subtitle = paste("Candidate SNPs (n =", length(outlier_snps), ") highlighted in red"),
+    x = paste0("RDA1 (", round(axis_var[1], 2), "%)"),
+    y = paste0("RDA2 (", round(axis_var[2], 2), "%)")
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 14),
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 12)
+  ) +
+  coord_fixed()
+
+print(loading_plot)
+```
+
+## Manhattan-style Plot of Candidate SNPs
+
+```{r manhattan-plot, fig.width=12, fig.height=6}
+# Prepare data for Manhattan plot
+manhattan_df <- data.frame(
+  SNP_index = 1:nrow(species_scores),
+  chromosome = vcf@fix[, "CHROM"],
+  position = as.numeric(vcf@fix[, "POS"]),
+  Mahalanobis_distance = maha_dist,
+  Outlier = 1:nrow(species_scores) %in% outlier_snps
+)
+
+# Convert chromosome to numeric if needed
+manhattan_df$chromosome <- as.factor(manhattan_df$chromosome)
+manhattan_df$chr_numeric <- as.numeric(manhattan_df$chromosome)
+
+# Create Manhattan plot
+manhattan_plot <- ggplot(manhattan_df, aes(x = SNP_index, y = Mahalanobis_distance)) +
+  geom_point(aes(color = Outlier), size = 1.5, alpha = 0.7) +
+  geom_hline(yintercept = outlier_threshold, linetype = "dashed", 
+             color = "red", size = 1) +
+  scale_color_manual(values = c("gray50", "red"),
+                     labels = c("Background SNPs", "Candidate SNPs")) +
+  labs(
+    title = "Manhattan Plot: Mahalanobis Distance for All SNPs",
+    subtitle = paste("Threshold =", round(outlier_threshold, 2), 
+                     "| Candidate SNPs =", length(outlier_snps)),
+    x = "SNP Index",
+    y = "Mahalanobis Distance"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 14),
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    legend.position = "bottom",
+    legend.title = element_blank()
+  )
+
+print(manhattan_plot)
+```
+
+# Save Results
+
+```{r save-results}
+cat("Step 14: Saving results...\n")
+
+# Save RData object
+save(rda_result, file = file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_results.RData")))
+cat("  - Saved RData object\n")
+
+# Save plots
+ggsave(file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_biplot.png")), 
+       rda_plot, width = 10, height = 8, dpi = 300)
+cat("  - Saved RDA biplot\n")
+
+if (exists("rda_plot_colored")) {
+  ggsave(file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_biplot_colored.png")), 
+         rda_plot_colored, width = 10, height = 8, dpi = 300)
+  cat("  - Saved colored RDA biplot\n")
+}
+
+ggsave(file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_snp_loadings.png")), 
+       loading_plot, width = 10, height = 8, dpi = 300)
+cat("  - Saved SNP loadings plot\n")
+
+ggsave(file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_manhattan.png")), 
+       manhattan_plot, width = 12, height = 6, dpi = 300)
+cat("  - Saved Manhattan plot\n")
+
+# Save candidate SNPs table
+write.csv(outlier_df, 
+          file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_outlier_snps.csv")), 
+          row.names = FALSE)
+cat("  - Saved candidate SNPs table\n")
+
+# Save environmental correlation matrix
+if (ncol(env_vars_final) > 1) {
+  png(file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_environmental_correlations.png")), 
+      width = 8, height = 8, units = "in", res = 300)
+  corrplot(env_cor_final, method = "color", type = "upper", 
+           tl.col = "black", tl.srt = 45, 
+           title = "Environmental Variable Correlations",
+           mar = c(0, 0, 2, 0))
+  dev.off()
+  cat("  - Saved environmental correlation plot\n")
+}
+
+# Create and save summary table
+rda_summary_table <- data.frame(
+  Metric = c("Total Variance", "Constrained Variance", "Unconstrained Variance", 
+             "Proportion Explained", "Number of Environmental Variables", 
+             "Number of Samples", "Number of SNPs", "Candidate SNPs"),
+  Value = c(
+    round(total_var, 2),
+    round(constrained_var, 2), 
+    round(unconstrained_var, 2),
+    paste0(round(var_explained * 100, 2), "%"),
+    ncol(env_vars_scaled),
+    nrow(genotype_data),
+    ncol(genotype_data),
+    length(outlier_snps)
+  )
+)
+
+write.csv(rda_summary_table, 
+          file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_summary_table.csv")), 
+          row.names = FALSE)
+cat("  - Saved summary table\n")
+```
+
+# Summary and Interpretation
+
+## Summary Table
+
+```{r summary-table}
+kable(rda_summary_table, caption = "RDA Analysis Summary") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## Interpretation Guidelines
+
+### Variance Explained
+
+The **proportion of constrained variance** indicates how much of the total genomic variation is explained by environmental variables.
+
+- **< 5%**: Weak environmental association
+- **5-15%**: Moderate environmental association  
+- **> 15%**: Strong environmental association
+
+**Your result:** `r round(var_explained * 100, 2)`%
+
+### Significance
+
+```{r interpretation}
+if (anova_overall$`Pr(>F)`[1] < 0.001) {
+  sig_interpretation <- "highly significant (p < 0.001)"
+} else if (anova_overall$`Pr(>F)`[1] < 0.01) {
+  sig_interpretation <- "very significant (p < 0.01)"
+} else if (anova_overall$`Pr(>F)`[1] < 0.05) {
+  sig_interpretation <- "significant (p < 0.05)"
+} else {
+  sig_interpretation <- "not significant (p ≥ 0.05)"
+}
+```
+
+The overall RDA model is **`r sig_interpretation`**, indicating that environmental variables `r if(anova_overall$'Pr(>F)'[1] < 0.05) "do" else "do not"` significantly explain genomic variation.
+
+### Candidate SNPs
+
+**`r length(outlier_snps)` candidate SNPs** were identified using the `r OUTLIER_QUANTILE * 100`th percentile threshold.
+
+**Next steps for candidate SNPs:**
+
+1. Annotate SNPs to identify genes and functional regions
+2. Validate findings with independent datasets
+3. Test for signatures of selection (e.g., Fst, iHS)
+4. Investigate biological functions and pathways
+5. Consider environmental associations for each candidate
+
+### Reading the RDA Biplot
+
+- **Points (samples)**: Positioned by their genomic variation constrained by environment
+- **Arrows (environmental variables)**: 
+  - Length indicates strength of relationship
+  - Direction shows environmental gradient
+  - Samples in arrow direction have higher values for that variable
+- **Arrow angles**: Show correlations between variables
+  - Acute angles (< 90°): Positive correlation
+  - Obtuse angles (> 90°): Negative correlation  
+  - Right angles (90°): No correlation
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
+
+# References
+
+1. Forester, B. R., et al. (2018). Comparing methods for detecting multilocus adaptation with multivariate genotype–environment associations. *Molecular Ecology*, 27(9), 2215-2233.
+
+2. Capblancq, T., & Forester, B. R. (2021). Redundancy analysis: A Swiss Army Knife for landscape genomics. *Methods in Ecology and Evolution*, 12(12), 2298-2309.
+
+3. Legendre, P., & Legendre, L. (2012). *Numerical ecology* (3rd ed.). Elsevier.
+
+4. Rellstab, C., et al. (2015). A practical guide to environmental association analysis in landscape genomics. *Molecular Ecology*, 24(17), 4348-4370.
+
+---
+
+**Analysis completed:** `r Sys.time()`
