@@ -1,0 +1,617 @@
+---
+title: "Geographic Sample Mapping with Regional Zoom"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 14,
+  fig.height = 8,
+  fig.align = 'center'
+)
+```
+
+# Introduction
+
+## What This Analysis Does
+
+This workflow creates publication-quality maps showing geographic distribution of samples with:
+
+- **World/continental overview map**: Shows all sample locations
+- **Regional zoom map**: Focused view on data extent
+- **Optional inset maps**: For specific regions of interest
+- **Customizable styling**: Colors, scales, annotations
+
+## Applications
+
+- **Sample collection maps**: Show sampling locations
+- **Germplasm diversity**: Display collection sites
+- **Population sampling**: Visualize study design
+- **Conservation**: Map priority areas
+- **Publications**: High-quality figure generation
+
+# Setup
+
+## Load Required Libraries
+
+```{r load-libraries}
+# Load required packages
+library(tidyverse)         # Data manipulation and ggplot2
+library(sf)                # Spatial data handling
+library(rnaturalearth)     # Map data
+library(rnaturalearthdata) # Additional map data
+library(ggspatial)         # Scale bars and north arrows
+library(patchwork)         # Combine plots
+library(knitr)             # Table formatting
+library(kableExtra)        # Enhanced tables
+
+cat("All required packages loaded successfully\n")
+```
+
+## Install High-Resolution Map Data (Optional)
+
+```{r install-hires, eval=FALSE}
+# For higher resolution maps (optional but recommended)
+install.packages("rnaturalearthhires", 
+                 repos = "http://packages.ropensci.org", 
+                 type = "source")
+```
+
+## Set Parameters
+
+```{r set-parameters}
+# ==================== INPUT FILE ====================
+DATA_CSV <- "your_sample_locations.csv"             # Path to coordinate CSV
+
+# ==================== COLUMN NAMES ====================
+SAMPLE_ID_COLUMN <- "SampleID"                      # Sample ID column
+LATITUDE_COLUMN <- "Latitude"                       # Latitude column
+LONGITUDE_COLUMN <- "Longitude"                     # Longitude column
+GROUP_COLUMN <- "Population"                        # Grouping variable (optional)
+
+# ==================== MAP PARAMETERS ====================
+# World/Overview map extent (set to NULL for automatic)
+WORLD_XLIM <- c(-180, 180)                          # Longitude range
+WORLD_YLIM <- c(-90, 90)                            # Latitude range
+
+# Regional map buffer (degrees to add around data extent)
+REGIONAL_BUFFER <- 2                                # Buffer in degrees
+
+# ==================== VISUAL PARAMETERS ====================
+POINT_SIZE <- 3                                     # Point size
+POINT_ALPHA <- 0.8                                  # Point transparency
+COLOR_PALETTE <- "Set1"                             # Color palette
+MAP_FILL_COLOR <- "wheat"                           # Land color
+OCEAN_COLOR <- "lightblue"                          # Ocean color
+
+# ==================== OUTPUT OPTIONS ====================
+OUTPUT_PREFIX <- "sample_map"                       # Prefix for output files
+OUTPUT_DIR <- "maps"                                # Output directory
+SAVE_DPI <- 300                                     # Resolution for saved maps
+
+# Create output directory
+if (!dir.exists(OUTPUT_DIR)) {
+  dir.create(OUTPUT_DIR, recursive = TRUE)
+}
+
+# Display parameters
+param_table <- data.frame(
+  Parameter = c("Data CSV", "Sample ID Column", "Latitude Column", 
+                "Longitude Column", "Group Column", "Regional Buffer"),
+  Value = c(DATA_CSV, SAMPLE_ID_COLUMN, LATITUDE_COLUMN, 
+            LONGITUDE_COLUMN, GROUP_COLUMN, 
+            paste(REGIONAL_BUFFER, "degrees"))
+)
+
+kable(param_table, caption = "Analysis Parameters") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+# Data Import and Preparation
+
+## Read Sample Coordinates
+
+```{r read-data}
+cat("Reading sample data:", DATA_CSV, "\n")
+
+# Check if file exists
+if (!file.exists(DATA_CSV)) {
+  stop("Data file not found: ", DATA_CSV)
+}
+
+# Read CSV
+sample_data <- read.csv(DATA_CSV, stringsAsFactors = FALSE)
+
+cat("Data loaded successfully\n")
+cat("  Total samples:", nrow(sample_data), "\n")
+
+# Display first few rows
+kable(head(sample_data), caption = "Sample Data Preview") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  scroll_box(width = "100%")
+
+# Check required columns exist
+required_cols <- c(SAMPLE_ID_COLUMN, LATITUDE_COLUMN, LONGITUDE_COLUMN)
+missing_cols <- setdiff(required_cols, colnames(sample_data))
+
+if (length(missing_cols) > 0) {
+  stop("Missing required columns: ", paste(missing_cols, collapse = ", "))
+}
+```
+
+## Filter to Valid Coordinates
+
+```{r filter-valid}
+cat("Filtering to valid coordinates...\n")
+
+# Count missing before filtering
+missing_before <- sum(is.na(sample_data[[LATITUDE_COLUMN]]) | 
+                     is.na(sample_data[[LONGITUDE_COLUMN]]))
+
+# Filter to valid coordinates
+sample_valid <- sample_data %>%
+  filter(!is.na(.data[[LATITUDE_COLUMN]]), 
+         !is.na(.data[[LONGITUDE_COLUMN]]))
+
+cat("Samples with missing coordinates:", missing_before, "\n")
+cat("Valid samples:", nrow(sample_valid), "\n")
+
+# Calculate coordinate ranges
+lat_range <- range(sample_valid[[LATITUDE_COLUMN]])
+lon_range <- range(sample_valid[[LONGITUDE_COLUMN]])
+
+# Create summary
+coord_summary <- data.frame(
+  Statistic = c("Total Samples", "Valid Coordinates", "Missing Coordinates",
+                "Min Latitude", "Max Latitude", "Latitude Range",
+                "Min Longitude", "Max Longitude", "Longitude Range"),
+  Value = c(
+    nrow(sample_data),
+    nrow(sample_valid),
+    missing_before,
+    round(lat_range[1], 4),
+    round(lat_range[2], 4),
+    round(diff(lat_range), 4),
+    round(lon_range[1], 4),
+    round(lon_range[2], 4),
+    round(diff(lon_range), 4)
+  )
+)
+
+kable(coord_summary, caption = "Coordinate Summary") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## Summary by Group (if applicable)
+
+```{r group-summary}
+if (GROUP_COLUMN %in% colnames(sample_valid)) {
+  cat("\nSummary by", GROUP_COLUMN, ":\n")
+  
+  group_summary <- sample_valid %>%
+    group_by(.data[[GROUP_COLUMN]]) %>%
+    summarise(
+      Count = n(),
+      Mean_Lat = round(mean(.data[[LATITUDE_COLUMN]], na.rm = TRUE), 4),
+      Mean_Lon = round(mean(.data[[LONGITUDE_COLUMN]], na.rm = TRUE), 4),
+      .groups = 'drop'
+    )
+  
+  kable(group_summary, 
+        caption = paste("Summary by", GROUP_COLUMN)) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+} else {
+  cat("\nNo grouping variable specified\n")
+}
+```
+
+# Load Map Data
+
+## Get Base Map Data
+
+```{r get-maps}
+cat("Loading map data...\n")
+
+# Get world countries (medium resolution)
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+cat("Medium resolution world map loaded\n")
+
+# Try to get high-resolution data
+world_hires <- NULL
+tryCatch({
+  library(rnaturalearthhires)
+  world_hires <- ne_countries(scale = "large", returnclass = "sf")
+  cat("High-resolution map data loaded\n")
+}, error = function(e) {
+  world_hires <- world
+  cat("High-resolution data not available, using medium resolution\n")
+  cat("Install with: install.packages('rnaturalearthhires', repos='http://packages.ropensci.org', type='source')\n")
+})
+
+# Get coastline for detail
+coastline <- ne_coastline(scale = "medium", returnclass = "sf")
+
+cat("Map data ready\n")
+```
+
+## Calculate Map Extents
+
+```{r calculate-extents}
+# Calculate data extent
+data_lon_min <- min(sample_valid[[LONGITUDE_COLUMN]])
+data_lon_max <- max(sample_valid[[LONGITUDE_COLUMN]])
+data_lat_min <- min(sample_valid[[LATITUDE_COLUMN]])
+data_lat_max <- max(sample_valid[[LATITUDE_COLUMN]])
+
+# Add buffer for regional map
+regional_lon_min <- max(data_lon_min - REGIONAL_BUFFER, -180)
+regional_lon_max <- min(data_lon_max + REGIONAL_BUFFER, 180)
+regional_lat_min <- max(data_lat_min - REGIONAL_BUFFER, -90)
+regional_lat_max <- min(data_lat_max + REGIONAL_BUFFER, 90)
+
+cat("\nData extent:\n")
+cat("  Longitude: [", round(data_lon_min, 2), ",", round(data_lon_max, 2), "]\n")
+cat("  Latitude:  [", round(data_lat_min, 2), ",", round(data_lat_max, 2), "]\n")
+
+cat("\nRegional map extent (with buffer):\n")
+cat("  Longitude: [", round(regional_lon_min, 2), ",", round(regional_lon_max, 2), "]\n")
+cat("  Latitude:  [", round(regional_lat_min, 2), ",", round(regional_lat_max, 2), "]\n")
+
+# Store extents
+extent_df <- data.frame(
+  Map = c("Data", "Data", "Regional", "Regional"),
+  Coordinate = c("Longitude", "Latitude", "Longitude", "Latitude"),
+  Min = c(data_lon_min, data_lat_min, regional_lon_min, regional_lat_min),
+  Max = c(data_lon_max, data_lat_max, regional_lon_max, regional_lat_max),
+  Range = c(
+    data_lon_max - data_lon_min,
+    data_lat_max - data_lat_min,
+    regional_lon_max - regional_lon_min,
+    regional_lat_max - regional_lat_min
+  )
+)
+
+kable(extent_df, digits = 4, caption = "Map Extents") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+# Create Maps
+
+## Define Common Theme
+
+```{r define-theme}
+# Common theme for all maps
+map_theme <- theme_bw() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold", size = 11),
+    legend.text = element_text(size = 10),
+    panel.grid.major = element_line(color = "gray80", linewidth = 0.2),
+    panel.background = element_rect(fill = OCEAN_COLOR, color = NA),
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 10)
+  )
+```
+
+## World/Overview Map
+
+```{r world-map, fig.width=12, fig.height=8}
+cat("Creating world overview map...\n")
+
+# Determine if we need world view or auto-zoom
+if (!is.null(WORLD_XLIM) && !is.null(WORLD_YLIM)) {
+  xlim_use <- WORLD_XLIM
+  ylim_use <- WORLD_YLIM
+  map_title <- "Sample Locations - World Overview"
+} else {
+  # Auto-zoom to continent/region
+  xlim_use <- c(regional_lon_min - 20, regional_lon_max + 20)
+  ylim_use <- c(regional_lat_min - 10, regional_lat_max + 10)
+  map_title <- "Sample Locations - Overview"
+}
+
+# Create base plot
+world_map <- ggplot() +
+  geom_sf(data = world, fill = MAP_FILL_COLOR, color = "black", linewidth = 0.3) +
+  coord_sf(xlim = xlim_use, ylim = ylim_use, expand = FALSE)
+
+# Add points with or without grouping
+if (GROUP_COLUMN %in% colnames(sample_valid)) {
+  world_map <- world_map +
+    geom_point(data = sample_valid, 
+               aes(x = .data[[LONGITUDE_COLUMN]], 
+                   y = .data[[LATITUDE_COLUMN]], 
+                   color = .data[[GROUP_COLUMN]]), 
+               size = POINT_SIZE, alpha = POINT_ALPHA) +
+    scale_color_brewer(palette = COLOR_PALETTE, name = GROUP_COLUMN)
+} else {
+  world_map <- world_map +
+    geom_point(data = sample_valid, 
+               aes(x = .data[[LONGITUDE_COLUMN]], 
+                   y = .data[[LATITUDE_COLUMN]]), 
+               color = "red", size = POINT_SIZE, alpha = POINT_ALPHA)
+}
+
+# Add annotations and theme
+world_map <- world_map +
+  labs(title = map_title,
+       x = "Longitude (°)", y = "Latitude (°)") +
+  annotation_scale(location = "bl", width_hint = 0.3) +
+  annotation_north_arrow(location = "tr", which_north = "true",
+                        height = unit(1, "cm"), width = unit(1, "cm"),
+                        style = north_arrow_fancy_orienteering) +
+  # Add box showing regional zoom area
+  geom_rect(aes(xmin = regional_lon_min, xmax = regional_lon_max, 
+                ymin = regional_lat_min, ymax = regional_lat_max),
+            fill = NA, color = "red", linewidth = 1, linetype = "dashed") +
+  map_theme
+
+print(world_map)
+```
+
+## Regional Zoom Map
+
+```{r regional-map, fig.width=12, fig.height=8}
+cat("Creating regional zoom map...\n")
+
+# Create regional map with higher detail
+regional_map <- ggplot() +
+  geom_sf(data = world_hires, fill = MAP_FILL_COLOR, color = "black", linewidth = 0.4) +
+  geom_sf(data = coastline, color = "black", linewidth = 0.2) +
+  coord_sf(xlim = c(regional_lon_min, regional_lon_max), 
+           ylim = c(regional_lat_min, regional_lat_max), 
+           expand = FALSE)
+
+# Add points with or without grouping
+if (GROUP_COLUMN %in% colnames(sample_valid)) {
+  regional_map <- regional_map +
+    geom_point(data = sample_valid, 
+               aes(x = .data[[LONGITUDE_COLUMN]], 
+                   y = .data[[LATITUDE_COLUMN]], 
+                   color = .data[[GROUP_COLUMN]]), 
+               size = POINT_SIZE * 1.5, alpha = POINT_ALPHA) +
+    scale_color_brewer(palette = COLOR_PALETTE, name = GROUP_COLUMN)
+} else {
+  regional_map <- regional_map +
+    geom_point(data = sample_valid, 
+               aes(x = .data[[LONGITUDE_COLUMN]], 
+                   y = .data[[LATITUDE_COLUMN]]), 
+               color = "red", size = POINT_SIZE * 1.5, alpha = POINT_ALPHA)
+}
+
+# Add annotations and theme
+regional_map <- regional_map +
+  labs(title = "Sample Locations - Regional Detail",
+       x = "Longitude (°)", y = "Latitude (°)") +
+  annotation_scale(location = "bl", width_hint = 0.3) +
+  annotation_north_arrow(location = "tr", which_north = "true",
+                        height = unit(1, "cm"), width = unit(1, "cm"),
+                        style = north_arrow_fancy_orienteering) +
+  map_theme
+
+print(regional_map)
+```
+
+## Combined Map (Side by Side)
+
+```{r combined-map, fig.width=16, fig.height=8}
+cat("Creating combined map...\n")
+
+# Combine maps side by side
+combined_map <- world_map + regional_map +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title = "Geographic Distribution of Samples",
+    subtitle = paste("Overview and regional detail | N =", nrow(sample_valid), "samples"),
+    theme = theme(
+      plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 14, hjust = 0.5)
+    )
+  ) &
+  theme(legend.position = "bottom")
+
+print(combined_map)
+```
+
+## Map with Sample Labels (Regional Only)
+
+```{r labeled-map, fig.width=12, fig.height=8}
+cat("Creating map with sample labels...\n")
+
+# Only add labels if not too many samples
+if (nrow(sample_valid) <= 50) {
+  
+  labeled_map <- ggplot() +
+    geom_sf(data = world_hires, fill = MAP_FILL_COLOR, color = "black", linewidth = 0.4) +
+    geom_sf(data = coastline, color = "black", linewidth = 0.2) +
+    coord_sf(xlim = c(regional_lon_min, regional_lon_max), 
+             ylim = c(regional_lat_min, regional_lat_max), 
+             expand = FALSE)
+  
+  # Add points and labels
+  if (GROUP_COLUMN %in% colnames(sample_valid)) {
+    labeled_map <- labeled_map +
+      geom_point(data = sample_valid, 
+                 aes(x = .data[[LONGITUDE_COLUMN]], 
+                     y = .data[[LATITUDE_COLUMN]], 
+                     color = .data[[GROUP_COLUMN]]), 
+                 size = POINT_SIZE * 1.5, alpha = POINT_ALPHA) +
+      scale_color_brewer(palette = COLOR_PALETTE, name = GROUP_COLUMN)
+  } else {
+    labeled_map <- labeled_map +
+      geom_point(data = sample_valid, 
+                 aes(x = .data[[LONGITUDE_COLUMN]], 
+                     y = .data[[LATITUDE_COLUMN]]), 
+                 color = "red", size = POINT_SIZE * 1.5, alpha = POINT_ALPHA)
+  }
+  
+  # Add labels
+  labeled_map <- labeled_map +
+    geom_text(data = sample_valid,
+              aes(x = .data[[LONGITUDE_COLUMN]], 
+                  y = .data[[LATITUDE_COLUMN]], 
+                  label = .data[[SAMPLE_ID_COLUMN]]),
+              size = 2.5, hjust = -0.2, vjust = 0.5, check_overlap = TRUE) +
+    labs(title = "Sample Locations with Labels",
+         x = "Longitude (°)", y = "Latitude (°)") +
+    annotation_scale(location = "bl", width_hint = 0.3) +
+    annotation_north_arrow(location = "tr", which_north = "true",
+                          height = unit(1, "cm"), width = unit(1, "cm"),
+                          style = north_arrow_fancy_orienteering) +
+    map_theme
+  
+  print(labeled_map)
+  
+} else {
+  cat("Too many samples (", nrow(sample_valid), ") for labeling\n")
+  cat("Skipping labeled map (recommended for ≤50 samples)\n")
+}
+```
+
+# Interactive Map (Optional)
+
+```{r interactive-map, eval=FALSE}
+# Create interactive map using leaflet (requires leaflet package)
+if (requireNamespace("leaflet", quietly = TRUE)) {
+  library(leaflet)
+  
+  interactive_map <- leaflet(sample_valid) %>%
+    addTiles() %>%
+    addCircleMarkers(
+      lng = ~get(LONGITUDE_COLUMN),
+      lat = ~get(LATITUDE_COLUMN),
+      popup = ~get(SAMPLE_ID_COLUMN),
+      radius = 6,
+      color = "red",
+      fillOpacity = 0.7
+    )
+  
+  # Display interactive map
+  interactive_map
+  
+  # Save interactive map
+  library(htmlwidgets)
+  saveWidget(interactive_map, 
+             file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_interactive.html")))
+  cat("Interactive map saved\n")
+} else {
+  cat("Install leaflet package for interactive maps: install.packages('leaflet')\n")
+}
+```
+
+# Save Maps
+
+```{r save-maps}
+cat("Saving maps to disk...\n")
+
+# Save world overview map
+ggsave(file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_world_overview.png")),
+       plot = world_map,
+       width = 12, height = 8, dpi = SAVE_DPI, bg = "white")
+cat("Saved: ", OUTPUT_PREFIX, "_world_overview.png\n")
+
+# Save regional map
+ggsave(file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_regional.png")),
+       plot = regional_map,
+       width = 12, height = 8, dpi = SAVE_DPI, bg = "white")
+cat("Saved: ", OUTPUT_PREFIX, "_regional.png\n")
+
+# Save combined map
+ggsave(file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_combined.png")),
+       plot = combined_map,
+       width = 16, height = 8, dpi = SAVE_DPI, bg = "white")
+cat("Saved: ", OUTPUT_PREFIX, "_combined.png\n")
+
+# Save labeled map if created
+if (exists("labeled_map")) {
+  ggsave(file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_labeled.png")),
+         plot = labeled_map,
+         width = 12, height = 8, dpi = SAVE_DPI, bg = "white")
+  cat("Saved: ", OUTPUT_PREFIX, "_labeled.png\n")
+}
+
+# Save coordinate data
+write.csv(sample_valid, 
+          file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_coordinates.csv")),
+          row.names = FALSE)
+cat("Saved: ", OUTPUT_PREFIX, "_coordinates.csv\n")
+
+# Save summary
+write.csv(coord_summary,
+          file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, "_summary.csv")),
+          row.names = FALSE)
+cat("Saved: ", OUTPUT_PREFIX, "_summary.csv\n")
+
+cat("\nAll maps saved successfully!\n")
+cat("Output directory:", OUTPUT_DIR, "\n")
+```
+
+# Summary Statistics
+
+```{r summary-stats}
+# Create comprehensive summary
+cat("\n=== SAMPLE MAPPING SUMMARY ===\n")
+cat("Total samples in file:", nrow(sample_data), "\n")
+cat("Samples with valid coordinates:", nrow(sample_valid), "\n")
+cat("Missing coordinates:", nrow(sample_data) - nrow(sample_valid), "\n")
+
+cat("\nGeographic extent:\n")
+cat("  Latitude range:", round(diff(lat_range), 2), "degrees\n")
+cat("  Longitude range:", round(diff(lon_range), 2), "degrees\n")
+
+cat("\nCenter point:\n")
+cat("  Latitude:", round(mean(lat_range), 4), "\n")
+cat("  Longitude:", round(mean(lon_range), 4), "\n")
+
+if (GROUP_COLUMN %in% colnames(sample_valid)) {
+  cat("\nSamples by", GROUP_COLUMN, ":\n")
+  print(table(sample_valid[[GROUP_COLUMN]]))
+}
+
+cat("\n=== FILES CREATED ===\n")
+cat("1. World overview map\n")
+cat("2. Regional detail map\n")
+cat("3. Combined side-by-side map\n")
+if (exists("labeled_map")) {
+  cat("4. Labeled map\n")
+}
+cat("5. Coordinate data CSV\n")
+cat("6. Summary statistics CSV\n")
+```
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
+
+# References
+
+1. **rnaturalearth**: South, A. (2017). rnaturalearth: World Map Data from Natural Earth. R package version 0.1.0.
+
+2. **sf**: Pebesma, E. (2018). Simple Features for R: Standardized Support for Spatial Vector Data. *The R Journal*, 10(1), 439-446.
+
+3. **ggspatial**: Dunnington, D. (2021). ggspatial: Spatial Data Framework for ggplot2. R package.
+
+---
+
+**Analysis completed:** `r Sys.time()`
