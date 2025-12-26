@@ -1,0 +1,875 @@
+---
+title: "Linkage Disequilibrium (LD) Decay Analysis"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    theme: cosmo
+  pdf_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 8,
+  dpi = 300
+)
+```
+
+## Overview
+
+This R Markdown document performs a comprehensive linkage disequilibrium (LD) decay analysis from VCF files. The analysis calculates pairwise LD (r²) between SNPs and models the decay of LD with physical distance.
+
+**What this analysis does:**
+
+- Calculates pairwise r² values between SNPs within chromosomes
+- Bins SNP pairs by distance and calculates mean r²
+- Fits exponential decay models to estimate LD decay
+- Generates genome-wide and per-chromosome visualizations
+- Calculates key metrics: half-decay distance and r²=0.2 threshold
+
+## Configuration
+
+**Edit these parameters to customize your analysis:**
+
+```{r config}
+# ============================================
+# INPUT/OUTPUT CONFIGURATION
+# ============================================
+
+# VCF file path (required)
+vcf_file <- "your_file.vcf.gz"  # Change to your VCF filename
+
+# Output prefix for all files
+output_prefix <- "ld_decay"
+
+# ============================================
+# ANALYSIS PARAMETERS
+# ============================================
+
+# Maximum distance for LD calculation (in bp)
+max_distance <- 1000000  # 1 Mb
+
+# Maximum number of SNP pairs to sample per chromosome
+sample_size <- 100000
+
+# Maximum number of SNPs to randomly sample per chromosome
+# (reduces computation for very dense marker sets)
+max_snps <- 20000
+
+# Minimum number of individuals required for LD calculation
+min_individuals <- 10
+
+# Random seed for reproducibility (set to NULL for random sampling)
+random_seed <- 12345
+
+# ============================================
+# DISTANCE BINS FOR SMOOTHING
+# ============================================
+
+# Distance bins for grouping SNP pairs (in bp)
+distance_bins <- c(0, 1000, 2500, 5000, 10000, 25000, 50000, 
+                   100000, 250000, 500000, 1000000)
+```
+
+## Load Required Libraries
+
+```{r libraries}
+cat("Loading required libraries...\n")
+
+# Core packages
+required_packages <- c("vcfR", "ggplot2", "dplyr")
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop("Required package '", pkg, "' is not installed.\n",
+         "Please install it with: install.packages('", pkg, "')")
+  }
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}
+
+# Optional color palette
+use_metbrewer <- FALSE
+if (requireNamespace("MetBrewer", quietly = TRUE)) {
+  suppressPackageStartupMessages(library(MetBrewer))
+  use_metbrewer <- TRUE
+  cat("Using MetBrewer color palettes\n")
+} else {
+  cat("Note: MetBrewer package not found. Using default colors.\n")
+}
+
+cat("All libraries loaded successfully.\n\n")
+```
+
+## Validate Configuration
+
+```{r validate}
+# Check if VCF file exists
+if (!file.exists(vcf_file)) {
+  stop("Error: VCF file '", vcf_file, "' not found!\n",
+       "Please update the 'vcf_file' variable in the configuration section.")
+}
+
+# Print analysis configuration
+cat("==========================================\n")
+cat("LD Decay Analysis Configuration\n")
+cat("==========================================\n")
+cat("VCF file:           ", vcf_file, "\n")
+cat("Max distance:       ", format(max_distance, big.mark = ","), " bp\n")
+cat("Sample size:        ", format(sample_size, big.mark = ","), " SNP pairs per chromosome\n")
+cat("Max SNPs sampled:   ", format(max_snps, big.mark = ","), " per chromosome\n")
+cat("Min individuals:    ", min_individuals, "\n")
+cat("Output prefix:      ", output_prefix, "\n")
+cat("Random seed:        ", ifelse(is.null(random_seed), "NULL (random)", random_seed), "\n")
+cat("==========================================\n\n")
+```
+
+## Read VCF File
+
+```{r read_vcf}
+cat("Reading VCF file...\n")
+
+vcf <- tryCatch({
+  read.vcfR(vcf_file, verbose = FALSE)
+}, error = function(e) {
+  stop("Error reading VCF file: ", e$message, "\n",
+       "Please ensure the file is a valid VCF format.")
+})
+
+n_variants <- nrow(vcf@fix)
+n_samples <- ncol(vcf@gt) - 1
+
+cat("VCF file loaded successfully!\n")
+cat("  Variants: ", format(n_variants, big.mark = ","), "\n")
+cat("  Samples:  ", n_samples, "\n\n")
+
+# Validation checks
+if (n_variants < 10) {
+  stop("Error: VCF file contains too few variants (", n_variants, 
+       "). Need at least 10 variants.")
+}
+
+if (n_samples < min_individuals) {
+  stop("Error: VCF file contains too few samples (", n_samples, "). ",
+       "Need at least ", min_individuals, " samples.")
+}
+```
+
+## Extract Genotype Data
+
+```{r extract_genotypes}
+cat("Extracting genotype data...\n")
+
+# Extract genotype matrix
+gt_matrix <- tryCatch({
+  extract.gt(vcf, element = "GT", as.numeric = TRUE)
+}, error = function(e) {
+  stop("Error extracting genotypes: ", e$message)
+})
+
+# Get chromosome and position information
+chrom_info <- data.frame(
+  chromosome = as.character(vcf@fix[, "CHROM"]),
+  position = as.numeric(vcf@fix[, "POS"]),
+  snp_id = 1:nrow(vcf@fix),
+  stringsAsFactors = FALSE
+)
+
+# Summary of chromosomes
+chrom_summary <- chrom_info %>%
+  group_by(chromosome) %>%
+  summarise(
+    n_snps = n(),
+    min_pos = min(position),
+    max_pos = max(position),
+    span_mb = round((max(position) - min(position)) / 1e6, 2)
+  ) %>%
+  arrange(desc(n_snps))
+
+cat("\nChromosome summary:\n")
+print(chrom_summary)
+```
+
+## Define Core Functions
+
+### Calculate r² Between SNPs
+
+```{r function_r2}
+# Function to calculate r-squared between two SNP vectors
+calculate_r2 <- function(snp1, snp2, min_ind = min_individuals) {
+  # Remove individuals with missing data
+  valid_idx <- !is.na(snp1) & !is.na(snp2)
+  
+  if (sum(valid_idx) < min_ind) return(NA)
+  
+  snp1_clean <- snp1[valid_idx]
+  snp2_clean <- snp2[valid_idx]
+  
+  # Check for variation
+  if (sd(snp1_clean) == 0 || sd(snp2_clean) == 0) return(NA)
+  
+  # Calculate correlation and square it for r²
+  r2 <- cor(snp1_clean, snp2_clean)^2
+  
+  # Ensure r² is between 0 and 1
+  if (is.na(r2) || is.nan(r2) || r2 < 0 || r2 > 1) {
+    return(NA)
+  }
+  
+  return(r2)
+}
+```
+
+### Estimate LD Decay per Chromosome
+
+```{r function_ld_decay}
+# Function to estimate LD decay for a single chromosome
+estimate_ld_decay_chromosome <- function(chrom_name, max_dist = max_distance, 
+                                         samp_size = sample_size, max_snp = max_snps) {
+  cat("Processing chromosome:", chrom_name, "\n")
+  
+  # Get SNPs for this chromosome
+  chrom_snps <- chrom_info[chrom_info$chromosome == chrom_name, ]
+  
+  if (nrow(chrom_snps) < 10) {
+    cat("  Skipping - insufficient SNPs (", nrow(chrom_snps), ")\n")
+    return(NULL)
+  }
+  
+  # Sample SNPs if too many
+  if (nrow(chrom_snps) > max_snp) {
+    if (!is.null(random_seed)) set.seed(random_seed + match(chrom_name, unique(chrom_info$chromosome)))
+    sampled_idx <- sample(1:nrow(chrom_snps), max_snp)
+    chrom_snps <- chrom_snps[sampled_idx, ]
+    cat("  Sampled", max_snp, "SNPs from", nrow(chrom_snps), "\n")
+  }
+  
+  # Get genotype data for this chromosome
+  chrom_gt <- gt_matrix[chrom_snps$snp_id, , drop = FALSE]
+  chrom_positions <- chrom_snps$position
+  
+  # Generate all possible SNP pairs
+  n_snps <- nrow(chrom_snps)
+  pairs_df <- expand.grid(i = 1:n_snps, j = 1:n_snps)
+  pairs_df <- pairs_df[pairs_df$i < pairs_df$j, ]  # Only unique pairs
+  
+  # Calculate distances
+  pairs_df$distance <- abs(chrom_positions[pairs_df$i] - chrom_positions[pairs_df$j])
+  
+  # Filter by max distance
+  pairs_df <- pairs_df[pairs_df$distance <= max_dist & pairs_df$distance > 0, ]
+  
+  if (nrow(pairs_df) == 0) {
+    cat("  No SNP pairs within max distance\n")
+    return(NULL)
+  }
+  
+  # Sample pairs if too many
+  if (nrow(pairs_df) > samp_size) {
+    if (!is.null(random_seed)) set.seed(random_seed + match(chrom_name, unique(chrom_info$chromosome)) + 1000)
+    pairs_df <- pairs_df[sample(nrow(pairs_df), samp_size), ]
+  }
+  
+  cat("  Calculating r² for", nrow(pairs_df), "SNP pairs...\n")
+  
+  # Calculate r² for each pair
+  pairs_df$r2 <- mapply(function(i, j) {
+    calculate_r2(chrom_gt[i, ], chrom_gt[j, ])
+  }, pairs_df$i, pairs_df$j)
+  
+  # Remove NA values
+  pairs_df <- pairs_df[!is.na(pairs_df$r2), ]
+  
+  if (nrow(pairs_df) == 0) {
+    cat("  No valid r² values calculated\n")
+    return(NULL)
+  }
+  
+  cat("  Complete:", nrow(pairs_df), "valid r² values\n")
+  
+  # Return results
+  data.frame(
+    chromosome = chrom_name,
+    distance = pairs_df$distance,
+    r2 = pairs_df$r2,
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+### Fit Exponential Decay Model
+
+```{r function_fit_decay}
+# Function to fit exponential decay model
+fit_exponential_decay <- function(distances, r2_values) {
+  # Remove NA and infinite values
+  valid_idx <- !is.na(r2_values) & !is.na(distances) & 
+                is.finite(r2_values) & is.finite(distances) & 
+                distances > 0
+  
+  if (sum(valid_idx) < 10) {
+    return(list(a = NA, b = NA, r_squared = NA))
+  }
+  
+  dist <- distances[valid_idx]
+  r2 <- r2_values[valid_idx]
+  
+  # Try to fit exponential decay: r² = a * exp(-b * distance)
+  tryCatch({
+    # Initial parameter guesses
+    start_a <- max(r2, na.rm = TRUE)
+    start_b <- -log(0.5) / median(dist, na.rm = TRUE)
+    
+    model <- nls(r2 ~ a * exp(-b * dist), 
+                 start = list(a = start_a, b = start_b),
+                 control = list(maxiter = 100, warnOnly = TRUE))
+    
+    params <- coef(model)
+    
+    # Calculate R-squared
+    predictions <- predict(model)
+    ss_res <- sum((r2 - predictions)^2)
+    ss_tot <- sum((r2 - mean(r2))^2)
+    r_squared <- 1 - (ss_res / ss_tot)
+    
+    list(
+      a = params["a"],
+      b = params["b"],
+      r_squared = r_squared
+    )
+  }, error = function(e) {
+    list(a = NA, b = NA, r_squared = NA)
+  })
+}
+```
+
+## Calculate LD Decay
+
+```{r calculate_ld, results='hide'}
+cat("\nCalculating LD decay for each chromosome...\n")
+cat("==========================================\n")
+
+# Get unique chromosomes
+chromosomes <- unique(chrom_info$chromosome)
+
+# Process each chromosome
+ld_results_list <- lapply(chromosomes, function(chrom) {
+  estimate_ld_decay_chromosome(chrom)
+})
+
+# Combine results
+all_ld_results <- do.call(rbind, ld_results_list[!sapply(ld_results_list, is.null)])
+
+cat("\n==========================================\n")
+cat("LD calculation complete!\n")
+cat("Total SNP pairs analyzed:", format(nrow(all_ld_results), big.mark = ","), "\n")
+cat("Chromosomes processed:", length(unique(all_ld_results$chromosome)), "\n")
+cat("==========================================\n\n")
+```
+
+## Summary Statistics
+
+```{r summary_stats}
+# Create distance bins and summarize
+all_ld_results$distance_bin <- cut(
+  all_ld_results$distance,
+  breaks = distance_bins,
+  include.lowest = TRUE
+)
+
+ld_summary <- all_ld_results %>%
+  group_by(chromosome, distance_bin) %>%
+  summarise(
+    n_pairs = n(),
+    mean_r2 = mean(r2, na.rm = TRUE),
+    median_r2 = median(r2, na.rm = TRUE),
+    sd_r2 = sd(r2, na.rm = TRUE),
+    mean_distance = mean(distance, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(distance_bin))
+
+# Display summary table
+cat("LD Summary Statistics (first 20 rows):\n")
+print(head(ld_summary, 20))
+```
+
+## Fit Decay Models
+
+```{r fit_models}
+cat("\nFitting exponential decay models...\n")
+
+# Fit model for each chromosome
+decay_parameters <- data.frame()
+smooth_decay_data <- data.frame()
+
+for (chrom in unique(all_ld_results$chromosome)) {
+  chrom_data <- all_ld_results[all_ld_results$chromosome == chrom, ]
+  
+  # Fit model
+  model_fit <- fit_exponential_decay(chrom_data$distance, chrom_data$r2)
+  
+  if (!is.na(model_fit$a) && !is.na(model_fit$b)) {
+    # Calculate half-decay distance
+    half_decay <- log(2) / model_fit$b
+    
+    # Calculate r²=0.2 threshold distance
+    r2_0.2_dist <- if (model_fit$a > 0.2) {
+      -log(0.2 / model_fit$a) / model_fit$b
+    } else {
+      NA
+    }
+    
+    # Store parameters
+    decay_parameters <- rbind(
+      decay_parameters,
+      data.frame(
+        chromosome = chrom,
+        a = model_fit$a,
+        b = model_fit$b,
+        r_squared = model_fit$r_squared,
+        half_decay_distance = half_decay,
+        r2_0.2_distance = r2_0.2_dist
+      )
+    )
+    
+    # Generate smooth curve
+    dist_range <- seq(1, max_distance, length.out = 100)
+    predicted_r2 <- model_fit$a * exp(-model_fit$b * dist_range)
+    
+    smooth_decay_data <- rbind(
+      smooth_decay_data,
+      data.frame(
+        chromosome = chrom,
+        distance = dist_range,
+        predicted_r2 = predicted_r2
+      )
+    )
+  }
+}
+
+# Display decay parameters
+cat("\nDecay Parameters:\n")
+print(decay_parameters)
+```
+
+## Genome-wide Analysis
+
+```{r genome_wide}
+cat("\nCalculating genome-wide LD decay...\n")
+
+# Bin all data across genome
+all_ld_results$genome_bin <- cut(
+  all_ld_results$distance,
+  breaks = distance_bins,
+  include.lowest = TRUE
+)
+
+genome_wide_summary <- all_ld_results %>%
+  group_by(genome_bin) %>%
+  summarise(
+    n_pairs = n(),
+    mean_r2 = mean(r2, na.rm = TRUE),
+    median_r2 = median(r2, na.rm = TRUE),
+    sd_r2 = sd(r2, na.rm = TRUE),
+    mean_distance = mean(distance, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(genome_bin))
+
+# Fit genome-wide model
+gw_model <- fit_exponential_decay(all_ld_results$distance, all_ld_results$r2)
+
+if (!is.na(gw_model$a) && !is.na(gw_model$b)) {
+  gw_half_decay <- log(2) / gw_model$b
+  gw_r2_0.2 <- if (gw_model$a > 0.2) {
+    -log(0.2 / gw_model$a) / gw_model$b
+  } else {
+    NA
+  }
+  
+  genome_wide_params <- data.frame(
+    a = gw_model$a,
+    b = gw_model$b,
+    r_squared = gw_model$r_squared,
+    half_decay_distance = gw_half_decay,
+    r2_0.2_distance = gw_r2_0.2
+  )
+  
+  # Generate smooth curve
+  gw_dist_range <- seq(1, max_distance, length.out = 100)
+  gw_smooth_data <- data.frame(
+    distance = gw_dist_range,
+    predicted_r2 = gw_model$a * exp(-gw_model$b * gw_dist_range)
+  )
+  
+  cat("\nGenome-wide Decay Parameters:\n")
+  cat("  Half-decay distance:", format(round(gw_half_decay), big.mark = ","), "bp\n")
+  if (!is.na(gw_r2_0.2)) {
+    cat("  r²=0.2 distance:    ", format(round(gw_r2_0.2), big.mark = ","), "bp\n")
+  }
+  cat("  Model R²:           ", round(gw_model$r_squared, 3), "\n")
+} else {
+  genome_wide_params <- NULL
+  gw_smooth_data <- NULL
+  cat("Warning: Could not fit genome-wide model\n")
+}
+```
+
+## Visualizations
+
+### Setup Colors
+
+```{r setup_colors}
+# Set up color palette
+n_chroms <- length(unique(all_ld_results$chromosome))
+
+if (use_metbrewer && n_chroms <= 12) {
+  color_palette <- met.brewer("Hiroshige", n = n_chroms)
+} else {
+  # Use rainbow colors as fallback
+  color_palette <- rainbow(n_chroms, s = 0.6, v = 0.8)
+}
+
+names(color_palette) <- unique(all_ld_results$chromosome)
+```
+
+### Genome-wide LD Decay (Binned)
+
+```{r plot_genome_wide_binned, fig.width=10, fig.height=8}
+if (!is.null(genome_wide_params)) {
+  subtitle_text <- paste0(
+    "Half-decay: ", format(round(genome_wide_params$half_decay_distance), big.mark = ","), " bp"
+  )
+  
+  if (!is.na(genome_wide_params$r2_0.2_distance)) {
+    subtitle_text <- paste0(
+      subtitle_text, 
+      " | r²=0.2: ", 
+      format(round(genome_wide_params$r2_0.2_distance), big.mark = ","), 
+      " bp"
+    )
+  }
+  
+  genome_wide_plot <- ggplot() +
+    geom_point(
+      data = genome_wide_summary,
+      aes(x = mean_distance/1000, y = mean_r2),
+      color = "darkblue",
+      size = 3,
+      alpha = 0.6
+    ) +
+    geom_line(
+      data = gw_smooth_data,
+      aes(x = distance/1000, y = predicted_r2),
+      color = "red",
+      size = 1.5
+    ) +
+    geom_hline(yintercept = 0.2, color = "orange", linetype = "dotted", size = 0.8) +
+    geom_vline(
+      xintercept = genome_wide_params$half_decay_distance/1000,
+      color = "red",
+      linetype = "dashed",
+      size = 1
+    )
+  
+  if (!is.na(genome_wide_params$r2_0.2_distance)) {
+    genome_wide_plot <- genome_wide_plot +
+      geom_vline(
+        xintercept = genome_wide_params$r2_0.2_distance/1000,
+        color = "orange",
+        linetype = "dashed",
+        size = 1
+      )
+  }
+  
+  genome_wide_plot <- genome_wide_plot +
+    scale_x_log10(breaks = c(1, 10, 100, 1000), labels = c("1", "10", "100", "1000")) +
+    labs(
+      title = "Genome-wide Average LD Decay (Binned)",
+      subtitle = subtitle_text,
+      x = "Distance (kb, log scale)",
+      y = "Mean r²"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5, size = 12, color = "gray50"),
+      axis.text = element_text(size = 12),
+      axis.title = element_text(size = 14),
+      panel.grid.minor = element_blank()
+    )
+  
+  print(genome_wide_plot)
+}
+```
+
+### Genome-wide LD Decay (Raw Data)
+
+```{r plot_genome_wide_raw, fig.width=10, fig.height=8}
+if (!is.null(genome_wide_params)) {
+  # Sample raw data if too many points
+  max_raw_points <- 5000
+  if (nrow(all_ld_results) > max_raw_points) {
+    sampled_raw <- all_ld_results[sample(nrow(all_ld_results), max_raw_points), ]
+    points_label <- paste0(format(max_raw_points, big.mark = ","), " sampled points of ", 
+                          format(nrow(all_ld_results), big.mark = ","))
+  } else {
+    sampled_raw <- all_ld_results
+    points_label <- paste0(format(nrow(all_ld_results), big.mark = ","), " SNP pairs")
+  }
+  
+  subtitle_text_raw <- paste0(
+    "Half-decay: ", format(round(genome_wide_params$half_decay_distance), big.mark = ","), " bp"
+  )
+  
+  if (!is.na(genome_wide_params$r2_0.2_distance)) {
+    subtitle_text_raw <- paste0(
+      subtitle_text_raw,
+      " | r²=0.2: ",
+      format(round(genome_wide_params$r2_0.2_distance), big.mark = ","),
+      " bp | "
+    )
+  } else {
+    subtitle_text_raw <- paste0(subtitle_text_raw, " | ")
+  }
+  subtitle_text_raw <- paste0(subtitle_text_raw, points_label)
+  
+  genome_wide_raw_plot <- ggplot() +
+    geom_point(
+      data = sampled_raw,
+      aes(x = distance/1000, y = r2),
+      color = "darkblue",
+      size = 1,
+      alpha = 0.2
+    ) +
+    geom_line(
+      data = gw_smooth_data,
+      aes(x = distance/1000, y = predicted_r2),
+      color = "red",
+      size = 1.5
+    ) +
+    geom_hline(yintercept = 0.2, color = "orange", linetype = "dotted", size = 0.8) +
+    geom_vline(
+      xintercept = genome_wide_params$half_decay_distance/1000,
+      color = "red",
+      linetype = "dashed",
+      size = 1
+    )
+  
+  if (!is.na(genome_wide_params$r2_0.2_distance)) {
+    genome_wide_raw_plot <- genome_wide_raw_plot +
+      geom_vline(
+        xintercept = genome_wide_params$r2_0.2_distance/1000,
+        color = "orange",
+        linetype = "dashed",
+        size = 1
+      )
+  }
+  
+  genome_wide_raw_plot <- genome_wide_raw_plot +
+    scale_x_log10(breaks = c(1, 10, 100, 1000), labels = c("1", "10", "100", "1000")) +
+    labs(
+      title = "Genome-wide LD Decay (Raw Data)",
+      subtitle = subtitle_text_raw,
+      x = "Distance (kb, log scale)",
+      y = "r²"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5, size = 12, color = "gray50"),
+      axis.text = element_text(size = 12),
+      axis.title = element_text(size = 14),
+      panel.grid.minor = element_blank()
+    )
+  
+  print(genome_wide_raw_plot)
+}
+```
+
+### Per-Chromosome LD Decay (Combined)
+
+```{r plot_combined, fig.width=14, fig.height=8}
+if (nrow(smooth_decay_data) > 0) {
+  ld_decay_plot <- ggplot() +
+    geom_point(
+      data = ld_summary,
+      aes(x = mean_distance/1000, y = mean_r2, color = chromosome),
+      size = 2,
+      alpha = 0.6
+    ) +
+    geom_line(
+      data = smooth_decay_data,
+      aes(x = distance/1000, y = predicted_r2, color = chromosome),
+      size = 1.2,
+      alpha = 0.9
+    ) +
+    scale_x_log10(breaks = c(1, 10, 100, 1000), labels = c("1", "10", "100", "1000")) +
+    labs(
+      title = "Linkage Disequilibrium Decay Across Chromosomes",
+      subtitle = "Exponential decay curves",
+      x = "Distance (kb, log scale)",
+      y = "Mean r²",
+      color = "Chromosome"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "right",
+      plot.title = element_text(hjust = 0.5, size = 14),
+      plot.subtitle = element_text(hjust = 0.5, size = 10, color = "gray50"),
+      axis.text = element_text(size = 10),
+      axis.title = element_text(size = 12)
+    ) +
+    scale_color_manual(values = color_palette)
+  
+  print(ld_decay_plot)
+}
+```
+
+### Per-Chromosome LD Decay (Faceted)
+
+```{r plot_faceted, fig.width=12, fig.height=8}
+if (nrow(smooth_decay_data) > 0) {
+  faceted_ld_plot <- ggplot() +
+    geom_point(
+      data = ld_summary,
+      aes(x = mean_distance/1000, y = mean_r2),
+      color = "darkblue",
+      size = 2,
+      alpha = 0.6
+    ) +
+    geom_line(
+      data = smooth_decay_data,
+      aes(x = distance/1000, y = predicted_r2),
+      color = "steelblue",
+      size = 1.2
+    ) +
+    facet_wrap(~ chromosome, scales = "free") +
+    scale_x_log10(breaks = c(1, 10, 100, 1000), labels = c("1", "10", "100", "1000")) +
+    labs(
+      title = "LD Decay by Chromosome",
+      x = "Distance (kb, log scale)",
+      y = "Mean r²"
+    ) +
+    theme_minimal() +
+    theme(
+      strip.text = element_text(size = 10, face = "bold"),
+      plot.title = element_text(hjust = 0.5, size = 14),
+      axis.text = element_text(size = 8)
+    )
+  
+  print(faceted_ld_plot)
+}
+```
+
+### Decay Distance Comparison
+
+```{r plot_comparison, fig.width=10, fig.height=6}
+if (nrow(decay_parameters) > 1) {
+  # Reshape data for grouped bar plot
+  decay_comparison <- data.frame(
+    chromosome = rep(decay_parameters$chromosome, 2),
+    distance_type = rep(c("Half-decay", "r²=0.2"), each = nrow(decay_parameters)),
+    distance_kb = c(
+      decay_parameters$half_decay_distance/1000,
+      decay_parameters$r2_0.2_distance/1000
+    )
+  )
+  
+  # Remove NA values
+  decay_comparison <- decay_comparison[!is.na(decay_comparison$distance_kb), ]
+  
+  decay_comparison_plot <- ggplot(
+    decay_comparison,
+    aes(x = chromosome, y = distance_kb, fill = distance_type)
+  ) +
+    geom_col(position = "dodge", alpha = 0.8) +
+    scale_fill_manual(values = c("Half-decay" = "steelblue", "r²=0.2" = "orange")) +
+    labs(
+      title = "LD Decay Distances by Chromosome",
+      subtitle = "Comparison of half-decay and r²=0.2 thresholds",
+      x = "Chromosome",
+      y = "Distance (kb)",
+      fill = "Threshold"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5, size = 10, color = "gray50"),
+      legend.position = "top"
+    )
+  
+  print(decay_comparison_plot)
+}
+```
+
+## Save Results
+
+```{r save_results}
+# Save raw LD results
+raw_file <- paste0(output_prefix, "_raw_results.csv")
+write.csv(all_ld_results, raw_file, row.names = FALSE)
+cat("Saved:", raw_file, "\n")
+
+# Save summary statistics
+summary_file <- paste0(output_prefix, "_summary.csv")
+write.csv(ld_summary, summary_file, row.names = FALSE)
+cat("Saved:", summary_file, "\n")
+
+# Save decay parameters
+if (nrow(decay_parameters) > 0) {
+  params_file <- paste0(output_prefix, "_parameters.csv")
+  write.csv(decay_parameters, params_file, row.names = FALSE)
+  cat("Saved:", params_file, "\n")
+}
+
+# Save genome-wide parameters
+if (!is.null(genome_wide_params)) {
+  gw_params_file <- paste0(output_prefix, "_genome_wide_parameters.csv")
+  write.csv(genome_wide_params, gw_params_file, row.names = FALSE)
+  cat("Saved:", gw_params_file, "\n")
+}
+```
+
+## Final Summary
+
+```{r final_summary}
+cat("\n==========================================\n")
+cat("LD Decay Analysis Complete!\n")
+cat("==========================================\n")
+cat("Total SNP pairs analyzed:  ", format(nrow(all_ld_results), big.mark = ","), "\n")
+cat("Chromosomes processed:     ", length(unique(all_ld_results$chromosome)), "\n")
+
+if (!is.null(genome_wide_params)) {
+  cat("\nGenome-wide metrics:\n")
+  cat("  Half-decay distance:   ", format(round(genome_wide_params$half_decay_distance), big.mark = ","), " bp\n")
+  if (!is.na(genome_wide_params$r2_0.2_distance)) {
+    cat("  r²=0.2 distance:       ", format(round(genome_wide_params$r2_0.2_distance), big.mark = ","), " bp\n")
+  }
+  cat("  Model R²:              ", round(genome_wide_params$r_squared, 3), "\n")
+}
+
+cat("\nOutput files created with prefix '", output_prefix, "':\n", sep = "")
+cat("  - Raw LD calculations\n")
+cat("  - Summary statistics (binned)\n")
+cat("  - Decay parameters (per chromosome)\n")
+cat("  - Genome-wide parameters\n")
+cat("==========================================\n")
+```
+
+## Session Information
+
+```{r session_info}
+sessionInfo()
+```
