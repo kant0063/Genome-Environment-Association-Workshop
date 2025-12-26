@@ -1,0 +1,1055 @@
+---
+title: "Genetic Offset Analysis for Climate Change Vulnerability"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 12,
+  fig.height = 8,
+  fig.align = 'center'
+)
+```
+
+# Introduction
+
+## What is Genetic Offset?
+
+**Genetic offset** quantifies the mismatch between a population's current genetic composition and the genetic composition predicted to be optimal under future environmental conditions. It serves as a measure of climate change vulnerability.
+
+**Key concepts:**
+
+- **Current adaptation**: Populations are adapted to their current local environments
+- **Climate change**: Future climates will differ from current conditions
+- **Genetic lag**: Populations may not evolve fast enough to track environmental change
+- **Vulnerability**: High genetic offset = high vulnerability to climate change
+
+## How Does This Analysis Work?
+
+This workflow integrates three key components:
+
+1. **Genomic data (VCF)**: SNP genotypes from populations across the landscape
+2. **Environmental data**: Current climate variables (from WorldClim)
+3. **Future climate projections**: CMIP6 models predicting future conditions
+
+**Analysis steps:**
+
+1. Identify genotype-environment associations using LFMM (Latent Factor Mixed Models)
+2. Calculate genetic offset based on environmental shifts
+3. Project vulnerability across geographic space
+4. Visualize results globally and regionally
+
+## Applications
+
+- **Conservation planning**: Identify vulnerable populations
+- **Assisted gene flow**: Guide translocation decisions
+- **Climate adaptation**: Predict which populations need intervention
+- **Breeding programs**: Select climate-resilient genotypes
+
+# Setup
+
+## Load Required Packages
+
+```{r load-packages}
+# Required packages
+required_pkgs <- c("vcfR", "LEA", "lfmm", "terra", "geodata", 
+                   "dplyr", "fields", "maps", "knitr", "kableExtra")
+
+# Check for missing packages
+missing <- required_pkgs[!required_pkgs %in% installed.packages()[, "Package"]]
+
+if (length(missing) > 0) {
+  cat("Installing missing packages:", paste(missing, collapse = ", "), "\n")
+  install.packages(missing, repos = "https://cloud.r-project.org")
+}
+
+# Load libraries
+library(vcfR)
+library(LEA)
+library(lfmm)
+library(terra)
+library(geodata)
+library(dplyr)
+library(fields)
+library(maps)
+library(knitr)
+library(kableExtra)
+
+cat("All required packages loaded successfully\n")
+```
+
+## Set Analysis Parameters
+
+```{r set-parameters}
+# ==================== INPUT FILES ====================
+VCF_FILE <- "your_genotypes.vcf"                    # Path to VCF file
+ENV_CSV <- "your_sample_coordinates.csv"            # CSV with sample coordinates
+
+# ==================== WORLDCLIM PARAMETERS ====================
+RES_MINUTES <- 10                                   # WorldClim resolution (2.5, 5, or 10 minutes)
+
+# ==================== CMIP6 CLIMATE MODELS ====================
+CMIP6_MODELS <- c(
+  "ACCESS-ESM1-5",      # Australia
+  "BCC-CSM2-MR",        # China
+  "CanESM5",            # Canada
+  "CNRM-CM6-1",         # France
+  "IPSL-CM6A-LR",       # France
+  "MIROC6"              # Japan
+)
+
+# ==================== CLIMATE SCENARIOS ====================
+SSP_SCENARIOS <- c("245", "585")                    # SSP2-4.5 (moderate), SSP5-8.5 (high)
+FUTURE_PERIODS <- c("2041-2060", "2081-2100")      # Mid-century and end-century
+
+# ==================== ANALYSIS PARAMETERS ====================
+GRID_RESOLUTION <- 200                              # Number of grid cells for projection
+K_LFMM <- 7                                         # Number of latent factors in LFMM
+PVALUE_CUTOFF <- 1e-5                               # P-value threshold for candidate SNPs
+MAX_PROJ_CLIP <- NA                                 # Set numeric value to clip extreme offsets
+
+# ==================== REGIONAL PLOTTING ====================
+REGIONAL_BUFFER_DEGREES <- 2                        # Buffer around data extent for regional plots
+
+# ==================== OUTPUT DIRECTORIES ====================
+WORK_DIR <- file.path(getwd(), "cmip6_cache")      # Cache for downloaded climate data
+OUT_DIR <- file.path(getwd(), "genetic_offset_results")
+REGIONAL_DIR <- file.path(OUT_DIR, "regional_plots")
+
+# Create directories
+dir.create(WORK_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(REGIONAL_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# Display parameter summary
+param_summary <- data.frame(
+  Parameter = c("VCF File", "Coordinate CSV", "WorldClim Resolution", 
+                "Climate Models", "SSP Scenarios", "Future Periods",
+                "Grid Resolution", "LFMM K", "P-value Cutoff"),
+  Value = c(VCF_FILE, ENV_CSV, paste(RES_MINUTES, "minutes"),
+            paste(length(CMIP6_MODELS), "models"), 
+            paste(SSP_SCENARIOS, collapse = ", "),
+            paste(FUTURE_PERIODS, collapse = ", "),
+            GRID_RESOLUTION, K_LFMM, PVALUE_CUTOFF)
+)
+
+kable(param_summary, caption = "Analysis Parameters") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## Helper Functions
+
+```{r helper-functions}
+# Normalize bioclim layer names to bio1, bio2, etc.
+normalize_bio_names <- function(n) {
+  n2 <- tolower(n)
+  digits <- gsub(".*?([0-9]+).*", "\\1", n2)
+  digits[grepl("^[^0-9]+$", digits)] <- NA
+  idx <- suppressWarnings(as.integer(digits))
+  idx[is.na(idx)] <- NA
+  paste0("bio", idx)
+}
+
+# Safe raster coercion
+to_spatraster <- function(x) {
+  if (inherits(x, "SpatRaster")) return(x)
+  rast(x)
+}
+
+# Check if matrix is valid for plotting
+is_valid_map <- function(m) {
+  is.matrix(m) && any(is.finite(m))
+}
+
+# Check if site is polymorphic
+is_polymorphic <- function(g) {
+  g2 <- g[g != 9]  # Remove missing (coded as 9)
+  if (length(g2) == 0) return(FALSE)
+  u <- unique(g2)
+  length(u) > 1  # Polymorphic if at least 2 genotypes
+}
+```
+
+# Data Import and Preparation
+
+## Read VCF and Prepare Genotype Matrix
+
+```{r read-vcf}
+cat("Reading VCF and preparing genotype matrix...\n")
+
+# Check if file exists
+if (!file.exists(VCF_FILE)) {
+  stop("VCF file not found: ", VCF_FILE)
+}
+
+# Convert VCF to LEA .geno format
+geno_file <- vcf2geno(VCF_FILE)
+
+# Read genotype matrix (0/1/2/9, where 9 = missing)
+genotype <- LEA::read.geno(geno_file)
+
+cat("Raw genotype dimensions (individuals x SNPs):", dim(genotype), "\n")
+
+# Remove monomorphic sites
+keep <- apply(genotype, 2, is_polymorphic)
+
+cat("Monomorphic SNPs removed:", sum(!keep), "\n")
+
+genotype <- genotype[, keep, drop = FALSE]
+
+cat("Filtered genotype dimensions:", dim(genotype), "\n")
+
+# Create genotype summary
+geno_summary <- data.frame(
+  Metric = c("Total individuals", "Raw SNPs", "Monomorphic SNPs removed", 
+             "Polymorphic SNPs retained", "Missing genotype rate"),
+  Value = c(
+    nrow(genotype),
+    length(keep),
+    sum(!keep),
+    sum(keep),
+    paste0(round(100 * mean(genotype == 9), 2), "%")
+  )
+)
+
+kable(geno_summary, caption = "Genotype Data Summary") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## Read Sample Coordinates
+
+```{r read-coordinates}
+cat("Reading sample coordinates from:", ENV_CSV, "\n")
+
+# Read CSV
+env_df <- read.csv(ENV_CSV, stringsAsFactors = FALSE)
+colnames(env_df) <- tolower(colnames(env_df))
+
+# Detect latitude and longitude columns
+if (!any(grepl("^lat", colnames(env_df)))) {
+  stop("No latitude column detected in CSV")
+}
+if (!any(grepl("^lon|^long", colnames(env_df)))) {
+  stop("No longitude column detected in CSV")
+}
+
+lat_col <- grep("^lat", colnames(env_df), value = TRUE)[1]
+lon_col <- grep("^lon|^long", colnames(env_df), value = TRUE)[1]
+sample_col <- colnames(env_df)[1]
+
+# Create coordinate dataframe
+coords <- data.frame(
+  Longitude = env_df[[lon_col]], 
+  Latitude = env_df[[lat_col]]
+)
+rownames(coords) <- env_df[[sample_col]]
+
+cat("Loaded", nrow(coords), "sample coordinates\n")
+
+# Calculate data extent
+min_lon <- min(coords$Longitude, na.rm = TRUE)
+max_lon <- max(coords$Longitude, na.rm = TRUE)
+min_lat <- min(coords$Latitude, na.rm = TRUE)
+max_lat <- max(coords$Latitude, na.rm = TRUE)
+
+cat("Data extent:\n")
+cat("  Longitude: [", min_lon, ",", max_lon, "]\n")
+cat("  Latitude:  [", min_lat, ",", max_lat, "]\n")
+
+# Display coordinate summary
+coord_summary <- data.frame(
+  Statistic = c("Min Longitude", "Max Longitude", "Min Latitude", "Max Latitude",
+                "Longitude Range", "Latitude Range"),
+  Value = c(
+    round(min_lon, 4),
+    round(max_lon, 4),
+    round(min_lat, 4),
+    round(max_lat, 4),
+    round(max_lon - min_lon, 4),
+    round(max_lat - min_lat, 4)
+  )
+)
+
+kable(coord_summary, caption = "Sample Coordinate Summary") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+# Save extent information
+extent_df <- data.frame(
+  parameter = c("min_longitude", "max_longitude", "min_latitude", "max_latitude"),
+  value = c(min_lon, max_lon, min_lat, max_lat)
+)
+write.csv(extent_df, file.path(OUT_DIR, "data_extent.csv"), row.names = FALSE)
+```
+
+## Visualize Sample Locations
+
+```{r plot-samples, fig.width=10, fig.height=6}
+# Create simple map of sample locations
+plot(coords$Longitude, coords$Latitude, 
+     pch = 21, bg = "red", col = "black", cex = 1.5,
+     xlab = "Longitude", ylab = "Latitude",
+     main = "Sample Locations")
+maps::map(add = TRUE, col = "gray70")
+grid()
+```
+
+# Historical Climate Data
+
+## Download WorldClim Bioclimatic Variables
+
+```{r download-worldclim}
+cat("Downloading/reading historical WorldClim bioclimatic variables...\n")
+cat("Resolution:", RES_MINUTES, "minutes\n")
+
+# Download WorldClim data
+clim_hist_raw <- worldclim_global(
+  var = "bio", 
+  res = RES_MINUTES, 
+  path = WORK_DIR, 
+  download = TRUE
+)
+
+clim_hist <- clim_hist_raw
+
+# Standardize layer names
+names(clim_hist) <- paste0("bio", seq_len(nlyr(clim_hist)))
+
+cat("Historical raster layers:", paste(names(clim_hist), collapse = ", "), "\n")
+
+# Display WorldClim variables
+bioclim_vars <- data.frame(
+  Variable = paste0("bio", 1:19),
+  Description = c(
+    "Annual Mean Temperature",
+    "Mean Diurnal Range",
+    "Isothermality",
+    "Temperature Seasonality",
+    "Max Temperature of Warmest Month",
+    "Min Temperature of Coldest Month",
+    "Temperature Annual Range",
+    "Mean Temperature of Wettest Quarter",
+    "Mean Temperature of Driest Quarter",
+    "Mean Temperature of Warmest Quarter",
+    "Mean Temperature of Coldest Quarter",
+    "Annual Precipitation",
+    "Precipitation of Wettest Month",
+    "Precipitation of Driest Month",
+    "Precipitation Seasonality",
+    "Precipitation of Wettest Quarter",
+    "Precipitation of Driest Quarter",
+    "Precipitation of Warmest Quarter",
+    "Precipitation of Coldest Quarter"
+  )
+)
+
+kable(bioclim_vars, caption = "WorldClim Bioclimatic Variables (BIO1-BIO19)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## Extract Environmental Data at Sample Points
+
+```{r extract-environment}
+cat("Extracting environmental data at sample locations...\n")
+
+# Create point data
+pts <- data.frame(x = coords$Longitude, y = coords$Latitude)
+
+# Extract values
+X.env_df <- terra::extract(clim_hist, pts)
+
+if (ncol(X.env_df) < 2) {
+  stop("Historical extraction failed or has no bands.")
+}
+
+# Remove ID column
+X.env <- X.env_df[, -1, drop = FALSE]
+
+# Impute missing values with column means
+X.env <- as.data.frame(lapply(X.env, function(x) {
+  x[is.na(x)] <- mean(x, na.rm = TRUE)
+  x
+}))
+
+# Keep only non-zero variance columns
+X.env <- X.env[, sapply(X.env, function(x) sd(x, na.rm = TRUE) > 0), drop = FALSE]
+
+if (ncol(X.env) == 0) {
+  stop("No non-zero-variance historic environmental columns.")
+}
+
+# Convert to matrix and scale
+X.env_mat <- as.matrix(X.env)
+X.env_scaled <- scale(X.env_mat)
+
+cat("Historical environment dimensions (samples x variables):", dim(X.env_mat), "\n")
+cat("Variables with non-zero variance:", ncol(X.env), "\n")
+
+# Display environmental data summary
+env_summary <- data.frame(
+  Variable = colnames(X.env),
+  Mean = round(colMeans(X.env), 2),
+  SD = round(apply(X.env, 2, sd), 2),
+  Min = round(apply(X.env, 2, min), 2),
+  Max = round(apply(X.env, 2, max), 2)
+)
+
+kable(env_summary, caption = "Environmental Data Summary at Sample Points") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+# LFMM: Genotype-Environment Association
+
+## Run LFMM Analysis
+
+```{r run-lfmm}
+cat("Running LFMM to identify genotype-environment associations...\n")
+cat("This may take several minutes depending on dataset size...\n")
+
+# Remove SNPs with complete missing data
+geno_filtered <- genotype[, colSums(genotype == 9) == 0]
+
+cat("SNPs after removing completely missing:", ncol(geno_filtered), "\n")
+
+# Run LFMM2
+mod_lfmm <- lfmm2(
+  input = geno_filtered, 
+  env = X.env_scaled, 
+  K = K_LFMM, 
+  effect.sizes = TRUE
+)
+
+# Extract effect size matrix
+B_mat <- mod_lfmm@B
+
+# Test for significance
+pv <- lfmm2.test(
+  mod_lfmm, 
+  input = geno_filtered, 
+  env = X.env_scaled, 
+  full = TRUE
+)
+
+# Identify candidate SNPs
+candidates <- which(-log10(pv$pvalues) > -log10(PVALUE_CUTOFF))
+
+cat("Candidate SNPs identified:", length(candidates), "\n")
+cat("Proportion of genome:", round(100 * length(candidates) / ncol(geno_filtered), 2), "%\n")
+
+if (length(candidates) == 0) {
+  stop("No candidate SNPs found. Consider:\n",
+       "  1. Loosening pvalue_cutoff\n",
+       "  2. Checking data quality\n",
+       "  3. Increasing sample size")
+}
+
+# Create LFMM summary
+lfmm_summary <- data.frame(
+  Metric = c("Total SNPs tested", "Latent factors (K)", "P-value threshold",
+             "Candidate SNPs", "Proportion of genome", "Environmental variables"),
+  Value = c(
+    ncol(geno_filtered),
+    K_LFMM,
+    PVALUE_CUTOFF,
+    length(candidates),
+    paste0(round(100 * length(candidates) / ncol(geno_filtered), 2), "%"),
+    ncol(X.env_scaled)
+  )
+)
+
+kable(lfmm_summary, caption = "LFMM Analysis Summary") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## Visualize LFMM Results
+
+```{r plot-lfmm, fig.width=10, fig.height=6}
+# Manhattan-style plot of -log10(p-values)
+log_pvals <- -log10(pv$pvalues)
+
+plot(1:length(log_pvals), log_pvals,
+     pch = 20, cex = 0.5, col = ifelse(log_pvals > -log10(PVALUE_CUTOFF), "red", "gray50"),
+     xlab = "SNP Index", ylab = "-log10(p-value)",
+     main = "LFMM: Genotype-Environment Associations")
+abline(h = -log10(PVALUE_CUTOFF), col = "blue", lty = 2, lwd = 2)
+legend("topright", legend = c("Candidate SNPs", "Neutral SNPs", "Threshold"),
+       col = c("red", "gray50", "blue"), pch = c(20, 20, NA), lty = c(NA, NA, 2),
+       lwd = c(NA, NA, 2))
+```
+
+# Create Projection Grid
+
+```{r create-grid}
+cat("Creating global projection grid...\n")
+cat("Grid resolution:", GRID_RESOLUTION, "cells\n")
+
+# Create longitude and latitude vectors
+long.vec <- seq(-180, 180, length = GRID_RESOLUTION)
+lat.vec <- seq(-90, 90, length = GRID_RESOLUTION)
+
+# Create coordinate grid
+coord.grid <- expand.grid(Longitude = long.vec, Latitude = lat.vec)
+
+cat("Total grid cells:", nrow(coord.grid), "\n")
+
+# Create spatial vector for extraction
+grid_pts <- vect(coord.grid, geom = c("Longitude", "Latitude"), crs = "EPSG:4326")
+
+cat("Projection grid created successfully\n")
+```
+
+# Future Climate Projections and Genetic Offset
+
+## Process CMIP6 Models
+
+This section downloads future climate projections and calculates genetic offset for each model, scenario, and time period.
+
+**Note:** This can take considerable time depending on:
+- Number of models
+- Number of scenarios and periods
+- Internet connection speed
+- Grid resolution
+
+```{r process-cmip6, cache=TRUE}
+cat("Processing CMIP6 climate models...\n")
+cat("Models:", paste(CMIP6_MODELS, collapse = ", "), "\n")
+cat("Scenarios:", paste(SSP_SCENARIOS, collapse = ", "), "\n")
+cat("Periods:", paste(FUTURE_PERIODS, collapse = ", "), "\n\n")
+
+# Storage for results
+combo_maps <- list()         # Mean maps per SSP×period
+all_per_model_maps <- list() # Individual model maps
+per_model_info <- list()     # Metadata
+
+# Initialize progress tracking
+total_combinations <- length(CMIP6_MODELS) * length(SSP_SCENARIOS) * length(FUTURE_PERIODS)
+current_iteration <- 0
+
+# Loop through all combinations
+for (model_name in CMIP6_MODELS) {
+  for (ssp in SSP_SCENARIOS) {
+    for (period in FUTURE_PERIODS) {
+      
+      current_iteration <- current_iteration + 1
+      combo_id <- paste0("ssp", ssp, "_", period)
+      run_id <- paste0(model_name, "_ssp", ssp, "_", period)
+      
+      cat("\n[", current_iteration, "/", total_combinations, "] Processing:", run_id, "\n")
+      
+      tryCatch({
+        # Download future climate data
+        cat("  Downloading future climate data...\n")
+        clim_fut_raw <- cmip6_world(
+          model = model_name,
+          ssp = ssp,
+          time = period,
+          var = "bioc",
+          res = RES_MINUTES,
+          path = WORK_DIR
+        )
+        
+        clim_fut <- to_spatraster(clim_fut_raw)
+        
+        # Normalize layer names
+        old_names <- names(clim_fut)
+        new_names <- normalize_bio_names(old_names)
+        names(clim_fut) <- new_names
+        
+        cat("  Future layers:", paste(names(clim_fut), collapse = ", "), "\n")
+        
+        # Match layers between historical and future
+        common_layers <- intersect(names(clim_hist), names(clim_fut))
+        
+        if (length(common_layers) == 0) {
+          cat("  WARNING: No common layers found. Skipping.\n")
+          next
+        }
+        
+        cat("  Common layers:", paste(common_layers, collapse = ", "), "\n")
+        
+        # Subset to common layers
+        clim_hist_subset <- clim_hist[[common_layers]]
+        clim_fut_subset <- clim_fut[[common_layers]]
+        
+        # Extract future environment at grid points
+        cat("  Extracting future environment at grid points...\n")
+        X.pred_df <- terra::extract(clim_fut_subset, grid_pts)
+        
+        if (ncol(X.pred_df) < 2) {
+          cat("  WARNING: Future extraction failed. Skipping.\n")
+          next
+        }
+        
+        X.pred <- X.pred_df[, -1, drop = FALSE]
+        
+        # Align columns with training data
+        train_cols <- colnames(X.env_mat)
+        pred_cols_available <- intersect(train_cols, colnames(X.pred))
+        
+        if (length(pred_cols_available) == 0) {
+          cat("  WARNING: No matching environmental variables. Skipping.\n")
+          next
+        }
+        
+        X.pred_aligned <- X.pred[, pred_cols_available, drop = FALSE]
+        X.env_mat_aligned <- X.env_mat[, pred_cols_available, drop = FALSE]
+        
+        # Scale future data using historical mean and SD
+        X.pred_scaled <- scale(X.pred_aligned, 
+                              center = attr(X.env_scaled, "scaled:center")[pred_cols_available],
+                              scale = attr(X.env_scaled, "scaled:scale")[pred_cols_available])
+        
+        # Calculate genetic offset
+        cat("  Calculating genetic offset...\n")
+        
+        offset_vec <- apply(X.pred_scaled, 1, function(x.pred) {
+          if (any(is.na(x.pred))) return(NA)
+          
+          # Genetic turnover calculation
+          pred_genetic <- B_mat[candidates, pred_cols_available, drop = FALSE] %*% x.pred
+          
+          # Calculate offset for each training sample
+          offsets_per_sample <- sapply(1:nrow(X.env_mat_aligned), function(i) {
+            x.train <- X.env_mat_aligned[i, pred_cols_available]
+            x.train_scaled <- (x.train - attr(X.env_scaled, "scaled:center")[pred_cols_available]) / 
+                             attr(X.env_scaled, "scaled:scale")[pred_cols_available]
+            
+            train_genetic <- B_mat[candidates, pred_cols_available, drop = FALSE] %*% x.train_scaled
+            
+            # Euclidean distance in genetic space
+            sqrt(sum((pred_genetic - train_genetic)^2))
+          })
+          
+          # Return mean offset
+          mean(offsets_per_sample, na.rm = TRUE)
+        })
+        
+        # Convert vector to matrix
+        offset_mat <- matrix(offset_vec, nrow = GRID_RESOLUTION, ncol = GRID_RESOLUTION, byrow = FALSE)
+        
+        # Apply clipping if specified
+        if (!is.na(MAX_PROJ_CLIP)) {
+          offset_mat[offset_mat > MAX_PROJ_CLIP] <- MAX_PROJ_CLIP
+        }
+        
+        # Store results
+        all_per_model_maps[[run_id]] <- offset_mat
+        
+        # Add to combo accumulator
+        if (!combo_id %in% names(combo_maps)) {
+          combo_maps[[combo_id]] <- list()
+        }
+        combo_maps[[combo_id]][[model_name]] <- offset_mat
+        
+        # Store metadata
+        per_model_info[[run_id]] <- list(
+          model = model_name,
+          ssp = ssp,
+          period = period,
+          common_layers = common_layers,
+          mean_offset = mean(offset_vec, na.rm = TRUE),
+          max_offset = max(offset_vec, na.rm = TRUE),
+          na_count = sum(is.na(offset_vec))
+        )
+        
+        cat("  Mean genetic offset:", round(mean(offset_vec, na.rm = TRUE), 4), "\n")
+        cat("  Max genetic offset:", round(max(offset_vec, na.rm = TRUE), 4), "\n")
+        cat("  Completed successfully!\n")
+        
+      }, error = function(e) {
+        cat("  ERROR:", e$message, "\n")
+        cat("  Skipping this combination.\n")
+      })
+    }
+  }
+}
+
+cat("\nAll CMIP6 model processing complete!\n")
+cat("Successfully processed", length(all_per_model_maps), "model combinations\n")
+```
+
+## Calculate Mean Genetic Offset
+
+```{r calculate-means}
+cat("Calculating mean genetic offset across models...\n")
+
+# Calculate mean for each SSP×period combination
+for (combo_id in names(combo_maps)) {
+  model_list <- combo_maps[[combo_id]]
+  
+  if (length(model_list) == 0) {
+    cat("Warning: No models for", combo_id, "\n")
+    next
+  }
+  
+  # Stack all model matrices
+  stacked <- simplify2array(model_list)
+  
+  # Calculate mean across models
+  mean_map <- apply(stacked, c(1, 2), mean, na.rm = TRUE)
+  
+  combo_maps[[combo_id]] <- mean_map
+  
+  cat("Combo:", combo_id, "- Mean offset:", round(mean(mean_map, na.rm = TRUE), 4), "\n")
+}
+
+# Calculate grand mean across all scenarios and periods
+cat("\nCalculating grand mean across all combinations...\n")
+
+all_combo_means <- lapply(combo_maps, function(x) if(is_valid_map(x)) x else NULL)
+all_combo_means <- all_combo_means[!sapply(all_combo_means, is.null)]
+
+if (length(all_combo_means) > 0) {
+  stacked_all <- simplify2array(all_combo_means)
+  grand_mean <- apply(stacked_all, c(1, 2), mean, na.rm = TRUE)
+  
+  cat("Grand mean offset:", round(mean(grand_mean, na.rm = TRUE), 4), "\n")
+  cat("Grand max offset:", round(max(grand_mean, na.rm = TRUE), 4), "\n")
+} else {
+  stop("No valid combo maps to calculate grand mean")
+}
+```
+
+# Visualization
+
+## Global Genetic Offset Maps
+
+```{r plot-global-maps, fig.width=14, fig.height=8}
+# Determine global color scale
+global_min <- min(sapply(all_per_model_maps, function(m) min(m, na.rm = TRUE)))
+global_max <- max(sapply(all_per_model_maps, function(m) max(m, na.rm = TRUE)))
+
+cat("Global offset range: [", global_min, ",", global_max, "]\n")
+
+# Color palette
+color_fun <- colorRampPalette(c("blue", "cyan", "yellow", "orange", "red"))(100)
+
+# Plot grand mean
+par(mfrow = c(1, 1), mar = c(5, 5, 4, 6))
+
+fields::image.plot(
+  long.vec, lat.vec, grand_mean,
+  col = color_fun,
+  zlim = c(global_min, global_max),
+  xlab = "Longitude", 
+  ylab = "Latitude",
+  main = "Grand Mean Genetic Offset (All Models, SSPs, & Periods)"
+)
+
+# Add sample points
+points(coords$Longitude, coords$Latitude, pch = 21, bg = "white", col = "black", cex = 1.5)
+
+# Add country outlines
+maps::map(add = TRUE, col = "gray30", lwd = 0.5)
+```
+
+## Individual Scenario Maps
+
+```{r plot-scenarios, fig.width=14, fig.height=10}
+# Plot each SSP×period combination
+n_combos <- length(combo_maps)
+n_cols <- 2
+n_rows <- ceiling(n_combos / n_cols)
+
+par(mfrow = c(n_rows, n_cols), mar = c(4, 4, 3, 5))
+
+for (combo_id in names(combo_maps)) {
+  mean_map <- combo_maps[[combo_id]]
+  
+  if (!is_valid_map(mean_map)) next
+  
+  fields::image.plot(
+    long.vec, lat.vec, mean_map,
+    col = color_fun,
+    zlim = c(global_min, global_max),
+    xlab = "Longitude",
+    ylab = "Latitude",
+    main = paste("Mean Genetic Offset -", combo_id)
+  )
+  
+  points(coords$Longitude, coords$Latitude, pch = 21, bg = "white", col = "black", cex = 1)
+  maps::map(add = TRUE, col = "gray30", lwd = 0.5)
+}
+```
+
+## Regional Maps (Data Extent)
+
+```{r plot-regional, fig.width=12, fig.height=8}
+# Calculate buffered extent for regional plots
+buffer_lon <- REGIONAL_BUFFER_DEGREES
+buffer_lat <- REGIONAL_BUFFER_DEGREES
+
+min_lon_buffered <- max(min_lon - buffer_lon, -180)
+max_lon_buffered <- min(max_lon + buffer_lon, 180)
+min_lat_buffered <- max(min_lat - buffer_lat, -90)
+max_lat_buffered <- min(max_lat + buffer_lat, 90)
+
+cat("Regional extent (with buffer):\n")
+cat("  Longitude: [", min_lon_buffered, ",", max_lon_buffered, "]\n")
+cat("  Latitude:  [", min_lat_buffered, ",", max_lat_buffered, "]\n")
+
+# Find grid indices within extent
+lon_idx <- which(long.vec >= min_lon_buffered & long.vec <= max_lon_buffered)
+lat_idx <- which(lat.vec >= min_lat_buffered & lat.vec <= max_lat_buffered)
+
+if (length(lon_idx) > 1 && length(lat_idx) > 1) {
+  
+  # Extract regional coordinates
+  long.vec.regional <- long.vec[lon_idx]
+  lat.vec.regional <- lat.vec[lat_idx]
+  
+  # Extract regional data
+  grand_mean_regional <- grand_mean[lon_idx, lat_idx, drop = FALSE]
+  
+  # Plot regional grand mean
+  par(mfrow = c(1, 1), mar = c(5, 5, 4, 6))
+  
+  fields::image.plot(
+    long.vec.regional, lat.vec.regional, grand_mean_regional,
+    col = color_fun,
+    zlim = c(global_min, global_max),
+    xlab = "Longitude",
+    ylab = "Latitude",
+    main = "Regional Grand Mean Genetic Offset"
+  )
+  
+  # Add sample points
+  points(coords$Longitude, coords$Latitude, pch = 21, bg = "white", col = "black", cex = 2)
+  
+  # Add map features
+  maps::map(xlim = range(long.vec.regional), ylim = range(lat.vec.regional),
+            add = TRUE, interior = TRUE, col = "grey30", lwd = 0.8)
+  maps::map(xlim = range(long.vec.regional), ylim = range(lat.vec.regional),
+            add = TRUE, interior = FALSE, col = "grey20", lwd = 1.5)
+  
+} else {
+  cat("Regional extent too small for plotting\n")
+}
+```
+
+# Save Results
+
+```{r save-results}
+cat("Saving results to disk...\n")
+
+# Save candidate SNPs
+write.csv(
+  data.frame(candidate_index = candidates),
+  file = file.path(OUT_DIR, "candidate_snps_index.csv"),
+  row.names = FALSE
+)
+
+# Save LFMM effect size matrix
+write.csv(
+  as.data.frame(B_mat),
+  file = file.path(OUT_DIR, "LFMM_B_matrix.csv"),
+  row.names = TRUE
+)
+
+# Save per-model metadata
+saveRDS(per_model_info, file = file.path(OUT_DIR, "per_model_debug_info.rds"))
+
+# Save global mean as GeoTIFF
+r_grand <- rast(t(grand_mean))
+ext(r_grand) <- c(-180, 180, -90, 90)
+crs(r_grand) <- "EPSG:4326"
+writeRaster(r_grand, file.path(OUT_DIR, "offset_GLOBAL_MEAN.tif"), overwrite = TRUE)
+
+cat("Grand mean raster saved to:", file.path(OUT_DIR, "offset_GLOBAL_MEAN.tif"), "\n")
+
+# Save individual scenario rasters
+for (combo_id in names(combo_maps)) {
+  mean_map <- combo_maps[[combo_id]]
+  if (!is_valid_map(mean_map)) next
+  
+  r_combo <- rast(t(mean_map))
+  ext(r_combo) <- c(-180, 180, -90, 90)
+  crs(r_combo) <- "EPSG:4326"
+  
+  tif_file <- file.path(OUT_DIR, paste0("offset_", combo_id, "_MEAN.tif"))
+  writeRaster(r_combo, tif_file, overwrite = TRUE)
+}
+
+cat("\nAll scenario rasters saved\n")
+
+# Save regional rasters if applicable
+if (length(lon_idx) > 1 && length(lat_idx) > 1) {
+  
+  # Regional grand mean
+  r_grand_regional <- rast(t(grand_mean_regional))
+  ext(r_grand_regional) <- c(min(long.vec.regional), max(long.vec.regional),
+                             min(lat.vec.regional), max(lat.vec.regional))
+  crs(r_grand_regional) <- "EPSG:4326"
+  writeRaster(r_grand_regional, 
+              file.path(REGIONAL_DIR, "REGIONAL_offset_GRAND_MEAN.tif"),
+              overwrite = TRUE)
+  
+  cat("Regional grand mean raster saved\n")
+}
+
+cat("\nAll results saved successfully!\n")
+```
+
+# Summary and Interpretation
+
+## Results Summary
+
+```{r results-summary}
+# Create comprehensive summary table
+results_summary <- data.frame(
+  Metric = c(
+    "Total samples",
+    "Total SNPs (polymorphic)",
+    "Candidate SNPs",
+    "Proportion of genome",
+    "Climate models processed",
+    "SSP scenarios",
+    "Time periods",
+    "Total model combinations",
+    "Mean genetic offset (grand mean)",
+    "Max genetic offset (grand mean)"
+  ),
+  Value = c(
+    nrow(coords),
+    ncol(genotype),
+    length(candidates),
+    paste0(round(100 * length(candidates) / ncol(genotype), 2), "%"),
+    length(CMIP6_MODELS),
+    paste(SSP_SCENARIOS, collapse = ", "),
+    paste(FUTURE_PERIODS, collapse = ", "),
+    length(all_per_model_maps),
+    round(mean(grand_mean, na.rm = TRUE), 4),
+    round(max(grand_mean, na.rm = TRUE), 4)
+  )
+)
+
+kable(results_summary, caption = "Analysis Summary") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## Interpretation Guide
+
+### Understanding Genetic Offset Values
+
+**Genetic offset** represents the magnitude of environmental change relative to current genotype-environment associations.
+
+- **Low offset (< 0.5)**: Populations well-adapted to future conditions
+- **Moderate offset (0.5-1.5)**: Some adaptation challenges expected
+- **High offset (> 1.5)**: Significant vulnerability to climate change
+
+**Important notes:**
+
+- Values are relative, not absolute
+- Compare across space to identify vulnerable regions
+- Higher values = greater mismatch between current genetics and future environment
+
+### Regional Patterns
+
+Look for:
+
+1. **Hotspots**: Areas with very high genetic offset
+   - Priority for conservation intervention
+   - Candidates for assisted gene flow
+   
+2. **Refugia**: Areas with low genetic offset
+   - May serve as climate refugia
+   - Source populations for translocation
+
+3. **Gradients**: Directional patterns in offset
+   - May guide translocation strategies
+   - Indicate direction of climate change impact
+
+### Management Implications
+
+**For high offset areas:**
+
+- **Monitor**: Increased surveillance of populations
+- **Protect**: Enhance habitat protection
+- **Assist**: Consider assisted migration
+- **Breed**: Use in breeding programs for climate resilience
+
+**For low offset areas:**
+
+- **Conserve**: Protect as potential refugia
+- **Source**: Use as seed sources for restoration
+- **Study**: Investigate adaptive mechanisms
+
+### Next Steps
+
+1. **Validate predictions**: 
+   - Monitor population responses to climate change
+   - Compare with empirical fitness data
+   
+2. **Functional analysis**:
+   - Annotate candidate SNPs
+   - Investigate functions of associated genes
+   
+3. **Integrate with other data**:
+   - Habitat suitability models
+   - Demographic projections
+   - Connectivity analyses
+
+4. **Conservation planning**:
+   - Prioritize management actions
+   - Design translocation experiments
+   - Develop climate adaptation strategies
+
+## Output Files
+
+**Data files:**
+
+- `candidate_snps_index.csv` - Indices of candidate SNPs
+- `LFMM_B_matrix.csv` - Effect size matrix from LFMM
+- `per_model_debug_info.rds` - Metadata for each model run
+- `data_extent.csv` - Geographic extent of data
+
+**Raster files (GeoTIFF):**
+
+- `offset_GLOBAL_MEAN.tif` - Grand mean across all models and scenarios
+- `offset_ssp245_2041-2060_MEAN.tif` - Mean for each scenario/period combination
+- `offset_ssp245_2081-2100_MEAN.tif`
+- `offset_ssp585_2041-2060_MEAN.tif`
+- `offset_ssp585_2081-2100_MEAN.tif`
+
+**Regional files (if applicable):**
+
+- `REGIONAL_offset_GRAND_MEAN.tif` - Regional grand mean
+- Additional regional files in `regional_plots/` directory
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
+
+# References
+
+1. Fitzpatrick, M. C., & Keller, S. R. (2015). Ecological genomics meets community-level modelling of biodiversity: mapping the genomic landscape of current and future environmental adaptation. *Ecology Letters*, 18(1), 1-16.
+
+2. Capblancq, T., et al. (2020). Evaluation of redundancy analysis to identify signatures of local adaptation. *Molecular Ecology Resources*, 20(6), 1625-1640.
+
+3. Caye, K., et al. (2019). LFMM 2: Fast and accurate inference of gene-environment associations in genome-wide studies. *Molecular Biology and Evolution*, 36(4), 852-860.
+
+4. Rellstab, C., et al. (2016). A practical guide to environmental association analysis in landscape genomics. *Molecular Ecology*, 25(17), 4095-4109.
+
+5. Bay, R. A., et al. (2018). Genomic signals of selection predict climate-driven population declines in a migratory bird. *Science*, 359(6371), 83-86.
+
+---
+
+**Analysis completed:** `r Sys.time()`
