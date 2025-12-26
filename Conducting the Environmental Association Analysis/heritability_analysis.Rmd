@@ -1,0 +1,654 @@
+---
+title: "Broad-Sense Heritability (H²) Analysis"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    theme: cosmo
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+## Overview
+
+This analysis calculates **broad-sense heritability (H²)** for multiple traits using linear mixed models. Heritability estimates are calculated both across all environments (overall) and for individual environments.
+
+**Key Outputs:**
+
+- Overall heritability across all environments
+- Environment-specific heritability estimates
+- Variance component decomposition (genetic, environment, replicate, residual)
+- Summary statistics and visualizations
+
+## Methods
+
+**Heritability Calculation:**
+
+Broad-sense heritability is calculated as:
+
+$$H^2 = \frac{\sigma^2_G}{\sigma^2_G + \frac{\sigma^2_E}{n_E} + \frac{\sigma^2_{Rep}}{n_E \times n_{Rep}} + \frac{\sigma^2_e}{n_E \times n_{Rep}}}$$
+
+Where:
+- $\sigma^2_G$ = genetic variance
+- $\sigma^2_E$ = environment variance
+- $\sigma^2_{Rep}$ = replicate variance
+- $\sigma^2_e$ = residual variance
+- $n_E$ = number of environments
+- $n_{Rep}$ = number of replicates
+
+For single environments:
+
+$$H^2 = \frac{\sigma^2_G}{\sigma^2_G + \frac{\sigma^2_{Rep}}{n_{Rep}} + \frac{\sigma^2_e}{n_{Rep}}}$$
+
+## Configuration
+
+**Edit these parameters for your data:**
+
+```{r config}
+# ============================================
+# INPUT DATA CONFIGURATION
+# ============================================
+
+# Input CSV file with phenotype data
+input_file <- "your_data.csv"
+
+# Column names for experimental design
+accession_col <- "accession"    # Genotype/accession identifier
+environment_col <- "environment"  # Environment/location/trial
+rep_col <- "rep"                 # Replicate/block
+
+# Minimum observations required per trait
+min_observations <- 10
+
+# ============================================
+# OUTPUT CONFIGURATION
+# ============================================
+
+# Prefix for output files
+output_prefix <- "heritability"
+
+# Heritability threshold for "high heritability" designation
+h2_threshold <- 0.3
+```
+
+## Load Required Libraries
+
+```{r libraries}
+# Load required packages
+required_packages <- c("lme4", "ggplot2", "dplyr", "tidyr", "knitr")
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop("Required package '", pkg, "' is not installed.\n",
+         "Please install it with: install.packages('", pkg, "')")
+  }
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}
+
+cat("All libraries loaded successfully.\n")
+```
+
+## Load and Prepare Data
+
+```{r load_data}
+# Check if input file exists
+if (!file.exists(input_file)) {
+  stop("Error: Input file '", input_file, "' not found!")
+}
+
+# Read data
+data <- read.csv(input_file, na.strings = c("NA", ".", ""))
+
+cat("Data loaded successfully!\n")
+cat("Dimensions:", nrow(data), "rows x", ncol(data), "columns\n\n")
+
+# Verify required columns exist
+required_cols <- c(accession_col, environment_col, rep_col)
+missing_cols <- setdiff(required_cols, names(data))
+
+if (length(missing_cols) > 0) {
+  stop("Error: Missing required columns: ", paste(missing_cols, collapse = ", "))
+}
+
+# Get trait names (all columns EXCEPT the design columns)
+trait_names <- setdiff(names(data), required_cols)
+
+cat("Found", length(trait_names), "traits to analyze:\n")
+cat(paste(trait_names, collapse = ", "), "\n\n")
+
+# Convert design factors to factors
+data[[accession_col]] <- as.factor(data[[accession_col]])
+data[[environment_col]] <- as.factor(data[[environment_col]])
+data[[rep_col]] <- as.factor(data[[rep_col]])
+
+# Convert trait columns to numeric
+for (trait in trait_names) {
+  data[[trait]] <- as.numeric(as.character(data[[trait]]))
+}
+
+# Display experimental design summary
+cat("Experimental Design:\n")
+cat("  Accessions:  ", nlevels(data[[accession_col]]), "\n")
+cat("  Environments:", nlevels(data[[environment_col]]), "\n")
+cat("  Replicates:  ", nlevels(data[[rep_col]]), "\n")
+cat("  Total plots: ", nrow(data), "\n\n")
+
+# Show first few rows
+cat("First rows of data:\n")
+print(head(data))
+```
+
+## Calculate Overall Heritability
+
+Heritability across all environments combined.
+
+```{r calculate_overall_h2}
+cat("Calculating heritabilities across all environments...\n\n")
+
+# Create empty list to store results
+h2_overall_list <- list()
+
+# Progress bar setup
+pb <- txtProgressBar(min = 0, max = length(trait_names), style = 3)
+
+for (i in seq_along(trait_names)) {
+  trait <- trait_names[i]
+  
+  tryCatch({
+    # Get clean data for this trait
+    df <- data[!is.na(data[[trait]]), ]
+    
+    # Skip if too little data
+    if (nrow(df) < min_observations) {
+      cat("  [", i, "/", length(trait_names), "] ", trait, 
+          " - Skipped (insufficient data)\n", sep = "")
+      next
+    }
+    
+    # Fit model with ALL effects as RANDOM
+    formula_str <- paste0(trait, " ~ (1|", accession_col, ") + (1|", 
+                          environment_col, ") + (1|", environment_col, ":", rep_col, ")")
+    model <- lmer(as.formula(formula_str), data = df, REML = TRUE)
+    
+    # Extract variance components
+    vc <- as.data.frame(VarCorr(model))
+    
+    var_g <- vc$vcov[vc$grp == accession_col]
+    var_env <- vc$vcov[vc$grp == environment_col]
+    var_rep <- vc$vcov[grepl(":", vc$grp) & grepl(environment_col, vc$grp)]
+    var_e <- vc$vcov[vc$grp == "Residual"]
+    
+    # Handle cases where variance components might be missing
+    if (length(var_g) == 0) var_g <- 0
+    if (length(var_env) == 0) var_env <- 0
+    if (length(var_rep) == 0) var_rep <- 0
+    if (length(var_e) == 0) var_e <- 0
+    
+    # Calculate broad-sense heritability
+    n_env <- length(unique(df[[environment_col]]))
+    n_rep <- length(unique(df[[rep_col]]))
+    
+    h2 <- var_g / (var_g + var_env/n_env + var_rep/(n_env*n_rep) + var_e/(n_env*n_rep))
+    
+    # Store results
+    h2_overall_list[[i]] <- data.frame(
+      trait = trait,
+      h2 = round(h2, 3),
+      var_g = round(var_g, 4),
+      var_env = round(var_env, 4),
+      var_rep = round(var_rep, 4),
+      var_res = round(var_e, 4),
+      n_obs = nrow(df),
+      n_env = n_env,
+      n_rep = n_rep,
+      stringsAsFactors = FALSE
+    )
+    
+  }, error = function(e) {
+    cat("  [", i, "/", length(trait_names), "] ", trait, 
+        " - ERROR: ", e$message, "\n", sep = "")
+  })
+  
+  setTxtProgressBar(pb, i)
+}
+
+close(pb)
+
+# Combine all results
+h2_overall_list <- h2_overall_list[!sapply(h2_overall_list, is.null)]
+
+if (length(h2_overall_list) > 0) {
+  h2_overall <- do.call(rbind, h2_overall_list)
+  rownames(h2_overall) <- NULL
+} else {
+  h2_overall <- data.frame(
+    trait = character(),
+    h2 = numeric(),
+    var_g = numeric(),
+    var_env = numeric(),
+    var_rep = numeric(),
+    var_res = numeric(),
+    n_obs = integer(),
+    n_env = integer(),
+    n_rep = integer(),
+    stringsAsFactors = FALSE
+  )
+}
+
+cat("\n\nOverall heritability calculation complete!\n")
+cat("Successfully analyzed:", nrow(h2_overall), "traits\n")
+```
+
+### Overall Heritability Summary
+
+```{r overall_summary}
+if (nrow(h2_overall) > 0) {
+  cat("\nSummary Statistics:\n")
+  cat("==========================================\n")
+  cat("Mean H²:   ", round(mean(h2_overall$h2, na.rm = TRUE), 3), "\n")
+  cat("Median H²: ", round(median(h2_overall$h2, na.rm = TRUE), 3), "\n")
+  cat("Range:     ", round(min(h2_overall$h2, na.rm = TRUE), 3), "-", 
+      round(max(h2_overall$h2, na.rm = TRUE), 3), "\n")
+  cat("Traits with H² >", h2_threshold, ":", 
+      sum(!is.na(h2_overall$h2) & h2_overall$h2 > h2_threshold), "\n")
+  cat("==========================================\n\n")
+  
+  # Display top traits
+  h2_sorted <- h2_overall[order(-h2_overall$h2), ]
+  
+  cat("Top 10 Traits by Overall Heritability:\n")
+  print(head(h2_sorted[, c("trait", "h2", "var_g", "var_env", "var_res")], 10))
+} else {
+  cat("No traits were successfully analyzed.\n")
+}
+```
+
+### Overall Heritability Distribution
+
+```{r plot_overall_h2, fig.width=10, fig.height=6}
+if (nrow(h2_overall) > 0) {
+  # Histogram
+  ggplot(h2_overall, aes(x = h2)) +
+    geom_histogram(bins = 30, fill = "steelblue", color = "black", alpha = 0.7) +
+    geom_vline(xintercept = h2_threshold, color = "red", linetype = "dashed", size = 1) +
+    labs(
+      title = "Distribution of Overall Heritability (Across All Environments)",
+      x = "Broad-Sense Heritability (H²)",
+      y = "Number of Traits"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      axis.text = element_text(size = 11),
+      axis.title = element_text(size = 12)
+    )
+}
+```
+
+### Variance Component Decomposition
+
+```{r plot_variance_components, fig.width=12, fig.height=8}
+if (nrow(h2_overall) > 0) {
+  # Prepare data for stacked bar plot
+  var_data <- h2_overall %>%
+    select(trait, var_g, var_env, var_rep, var_res) %>%
+    pivot_longer(cols = starts_with("var_"), 
+                 names_to = "component", 
+                 values_to = "variance") %>%
+    mutate(
+      component = factor(
+        component,
+        levels = c("var_g", "var_env", "var_rep", "var_res"),
+        labels = c("Genetic", "Environment", "Replicate", "Residual")
+      )
+    )
+  
+  # Calculate total variance for percentage
+  total_var <- h2_overall %>%
+    mutate(total = var_g + var_env + var_rep + var_res) %>%
+    select(trait, total)
+  
+  var_data <- var_data %>%
+    left_join(total_var, by = "trait") %>%
+    mutate(percentage = variance / total * 100)
+  
+  # Plot top 20 traits by heritability
+  top_20_traits <- h2_sorted$trait[1:min(20, nrow(h2_sorted))]
+  
+  var_data_top20 <- var_data %>%
+    filter(trait %in% top_20_traits) %>%
+    mutate(trait = factor(trait, levels = rev(top_20_traits)))
+  
+  ggplot(var_data_top20, aes(x = trait, y = percentage, fill = component)) +
+    geom_bar(stat = "identity", position = "stack") +
+    coord_flip() +
+    scale_fill_manual(
+      values = c(
+        "Genetic" = "#2ecc71",
+        "Environment" = "#e74c3c",
+        "Replicate" = "#f39c12",
+        "Residual" = "#95a5a6"
+      )
+    ) +
+    labs(
+      title = "Variance Component Decomposition (Top 20 Traits by H²)",
+      x = "Trait",
+      y = "Percentage of Total Variance (%)",
+      fill = "Component"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      axis.text = element_text(size = 10),
+      axis.title = element_text(size = 12),
+      legend.position = "top"
+    )
+}
+```
+
+## Calculate Environment-Specific Heritability
+
+Heritability for each environment separately.
+
+```{r calculate_env_specific_h2}
+cat("Calculating heritabilities for individual environments...\n\n")
+
+environments <- levels(data[[environment_col]])
+h2_by_env <- list()
+
+for (env in environments) {
+  cat("Processing environment:", env, "\n")
+  
+  env_h2_list <- list()
+  
+  for (trait in trait_names) {
+    tryCatch({
+      # Get data for this environment and trait
+      df <- data[data[[environment_col]] == env & !is.na(data[[trait]]), ]
+      
+      if (nrow(df) < min_observations) next
+      
+      # Fit model: accession and rep as RANDOM
+      formula_str <- paste0(trait, " ~ (1|", accession_col, ") + (1|", rep_col, ")")
+      model <- lmer(as.formula(formula_str), data = df, REML = TRUE)
+      
+      # Extract variance components
+      vc <- as.data.frame(VarCorr(model))
+      
+      var_g <- vc$vcov[vc$grp == accession_col]
+      var_rep <- vc$vcov[vc$grp == rep_col]
+      var_e <- vc$vcov[vc$grp == "Residual"]
+      
+      # Handle missing components
+      if (length(var_g) == 0) var_g <- 0
+      if (length(var_rep) == 0) var_rep <- 0
+      if (length(var_e) == 0) var_e <- 0
+      
+      # Calculate heritability for single environment
+      n_rep <- length(unique(df[[rep_col]]))
+      h2 <- var_g / (var_g + var_rep/n_rep + var_e/n_rep)
+      
+      # Store results
+      env_h2_list[[trait]] <- data.frame(
+        trait = trait,
+        h2 = round(h2, 3),
+        var_g = round(var_g, 4),
+        var_rep = round(var_rep, 4),
+        var_res = round(var_e, 4),
+        n_obs = nrow(df),
+        n_rep = n_rep,
+        stringsAsFactors = FALSE
+      )
+      
+    }, error = function(e) {})
+  }
+  
+  # Combine results for this environment
+  env_h2_list <- env_h2_list[!sapply(env_h2_list, is.null)]
+  
+  if (length(env_h2_list) > 0) {
+    env_h2 <- do.call(rbind, env_h2_list)
+    rownames(env_h2) <- NULL
+    h2_by_env[[as.character(env)]] <- env_h2
+    cat("  Completed:", nrow(env_h2), "traits\n")
+  } else {
+    cat("  No traits successfully analyzed\n")
+  }
+}
+
+cat("\nEnvironment-specific heritability calculation complete!\n")
+```
+
+### Environment-Specific Summary
+
+```{r env_specific_summary}
+if (length(h2_by_env) > 0) {
+  cat("\nEnvironment-Specific Heritability Summary:\n")
+  cat("==========================================\n")
+  
+  env_summary <- data.frame()
+  
+  for (env in names(h2_by_env)) {
+    env_data <- h2_by_env[[env]]
+    env_summary <- rbind(
+      env_summary,
+      data.frame(
+        environment = env,
+        n_traits = nrow(env_data),
+        mean_h2 = round(mean(env_data$h2, na.rm = TRUE), 3),
+        median_h2 = round(median(env_data$h2, na.rm = TRUE), 3),
+        high_h2_count = sum(!is.na(env_data$h2) & env_data$h2 > h2_threshold)
+      )
+    )
+  }
+  
+  print(env_summary)
+}
+```
+
+### Environment Comparison
+
+```{r plot_env_comparison, fig.width=12, fig.height=6}
+if (length(h2_by_env) > 0) {
+  # Combine all environment data
+  all_env_data <- data.frame()
+  
+  for (env in names(h2_by_env)) {
+    env_data <- h2_by_env[[env]]
+    env_data$environment <- env
+    all_env_data <- rbind(all_env_data, env_data)
+  }
+  
+  # Boxplot comparison
+  ggplot(all_env_data, aes(x = environment, y = h2, fill = environment)) +
+    geom_boxplot(alpha = 0.7) +
+    geom_hline(yintercept = h2_threshold, color = "red", linetype = "dashed", size = 1) +
+    labs(
+      title = "Heritability Distribution by Environment",
+      x = "Environment",
+      y = "Broad-Sense Heritability (H²)"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      axis.text = element_text(size = 11),
+      axis.title = element_text(size = 12),
+      legend.position = "none"
+    )
+}
+```
+
+### Heritability Comparison: Overall vs. Environment-Specific
+
+```{r plot_h2_comparison, fig.width=12, fig.height=8}
+if (length(h2_by_env) > 0 && nrow(h2_overall) > 0) {
+  # Reshape data for comparison
+  comparison_data <- data.frame()
+  
+  for (env in names(h2_by_env)) {
+    env_data <- h2_by_env[[env]] %>%
+      select(trait, h2) %>%
+      rename(env_h2 = h2) %>%
+      mutate(environment = env)
+    
+    comparison_data <- rbind(comparison_data, env_data)
+  }
+  
+  # Join with overall h2
+  comparison_data <- comparison_data %>%
+    left_join(h2_overall %>% select(trait, h2) %>% rename(overall_h2 = h2), 
+              by = "trait")
+  
+  # Plot
+  ggplot(comparison_data, aes(x = overall_h2, y = env_h2, color = environment)) +
+    geom_point(size = 2, alpha = 0.6) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black") +
+    labs(
+      title = "Environment-Specific vs. Overall Heritability",
+      x = "Overall H² (Across Environments)",
+      y = "Environment-Specific H²",
+      color = "Environment"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      axis.text = element_text(size = 11),
+      axis.title = element_text(size = 12),
+      legend.position = "right"
+    )
+}
+```
+
+## High Heritability Traits
+
+Traits with H² > `r h2_threshold` across all environments.
+
+```{r high_h2_traits}
+if (nrow(h2_overall) > 0) {
+  high_h2 <- h2_overall %>%
+    filter(!is.na(h2) & h2 > h2_threshold) %>%
+    arrange(desc(h2))
+  
+  if (nrow(high_h2) > 0) {
+    cat("Traits with Overall H² >", h2_threshold, ":\n")
+    print(high_h2)
+  } else {
+    cat("No traits with H² >", h2_threshold, "\n")
+  }
+}
+```
+
+## Save Results
+
+```{r save_results}
+# Export overall heritabilities
+overall_file <- paste0(output_prefix, "_overall.csv")
+write.csv(h2_overall, overall_file, row.names = FALSE)
+cat("Saved:", overall_file, "\n")
+
+# Export environment-specific heritabilities
+if (length(h2_by_env) > 0) {
+  for (env in names(h2_by_env)) {
+    env_file <- paste0(output_prefix, "_", env, ".csv")
+    write.csv(h2_by_env[[env]], env_file, row.names = FALSE)
+    cat("Saved:", env_file, "\n")
+  }
+}
+
+# Export combined environment-specific results
+if (length(h2_by_env) > 0) {
+  all_env_file <- paste0(output_prefix, "_by_environment_combined.csv")
+  all_env_combined <- data.frame()
+  
+  for (env in names(h2_by_env)) {
+    env_data <- h2_by_env[[env]]
+    env_data$environment <- env
+    all_env_combined <- rbind(all_env_combined, env_data)
+  }
+  
+  write.csv(all_env_combined, all_env_file, row.names = FALSE)
+  cat("Saved:", all_env_file, "\n")
+}
+```
+
+## Final Summary
+
+```{r final_summary}
+cat("\n================================================================================\n")
+cat("HERITABILITY ANALYSIS COMPLETE!\n")
+cat("================================================================================\n")
+cat("Input file:              ", input_file, "\n")
+cat("Total traits processed:  ", length(trait_names), "\n")
+cat("Traits successfully analyzed (overall):", nrow(h2_overall), "\n")
+
+if (nrow(h2_overall) > 0) {
+  cat("\nOverall Heritability Statistics:\n")
+  cat("  Mean H²:               ", round(mean(h2_overall$h2, na.rm = TRUE), 3), "\n")
+  cat("  Traits with H² >", h2_threshold, ":", 
+      sum(!is.na(h2_overall$h2) & h2_overall$h2 > h2_threshold), "\n")
+}
+
+if (length(h2_by_env) > 0) {
+  cat("\nEnvironments analyzed:   ", length(h2_by_env), "\n")
+  for (env in names(h2_by_env)) {
+    env_data <- h2_by_env[[env]]
+    cat("  ", env, ": ", nrow(env_data), " traits (mean H² = ", 
+        round(mean(env_data$h2, na.rm = TRUE), 3), ")\n", sep = "")
+  }
+}
+
+cat("\nOutput files created:\n")
+cat("  - ", overall_file, "\n", sep = "")
+if (length(h2_by_env) > 0) {
+  for (env in names(h2_by_env)) {
+    cat("  - ", output_prefix, "_", env, ".csv\n", sep = "")
+  }
+  cat("  - ", all_env_file, "\n", sep = "")
+}
+cat("================================================================================\n")
+```
+
+## Session Information
+
+```{r session_info}
+sessionInfo()
+```
+
+---
+
+## Interpretation Guide
+
+**Heritability (H²) Ranges:**
+
+- **H² < 0.2**: Low heritability - trait heavily influenced by environment
+- **0.2 ≤ H² < 0.5**: Moderate heritability - mixed genetic and environmental control
+- **H² ≥ 0.5**: High heritability - trait strongly controlled by genetics
+
+**Variance Components:**
+
+- **Genetic variance (σ²_G)**: Variation due to genetic differences between accessions
+- **Environment variance (σ²_E)**: Variation due to differences between environments
+- **Replicate variance (σ²_Rep)**: Variation due to replicate/block effects within environments
+- **Residual variance (σ²_e)**: Unexplained variation (measurement error, micro-environment, etc.)
+
+**Applications:**
+
+- Traits with high H² are good candidates for marker-assisted selection
+- Traits with low H² may benefit from improved experimental design or environmental control
+- Comparing overall vs. environment-specific H² reveals genotype × environment interactions
