@@ -1,0 +1,244 @@
+---
+title: "Extract Bioclim Data from Geographic Coordinates"
+output: pdf_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Overview
+
+This script extracts bioclim variables for a set of geographic coordinates and visualizes them on a world map.
+
+**Requirements:**
+- A CSV file with columns named "Latitude" and "Longitude" (case-sensitive)
+- Optional: An ID column to identify each location
+
+## Load Libraries
+
+```{r}
+library(terra)
+library(geodata)
+library(raster)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(ggplot2)
+```
+
+## Configuration
+
+**Edit these parameters to customize for your data:**
+
+```{r}
+# Input CSV file (must contain "Latitude" and "Longitude" columns)
+input_file <- "your_data.csv"
+
+# Output file name for extracted bioclim data
+output_file <- "bioclim_data_extracted.csv"
+
+# Optional: Name of ID column in your CSV (set to NULL if none)
+id_column <- NULL  # e.g., "SampleID", "Accession", etc.
+
+# Bioclim resolution: 10, 5, 2.5, or 0.5 (in minutes of a degree)
+# Lower resolution = faster download but less detailed
+bioclim_resolution <- 2.5
+
+# Directory to store downloaded bioclim rasters
+bioclim_dir <- "bioclim_data/"
+```
+
+## Download Bioclim Data
+
+Downloads WorldClim bioclim variables if not already present.
+
+```{r}
+# Create directory if it doesn't exist
+if (!dir.exists(bioclim_dir)) {
+  dir.create(bioclim_dir, recursive = TRUE)
+}
+
+# Download bioclim data (will skip if already downloaded)
+bioclim_rasters <- worldclim_global(
+  var = "bio",
+  res = bioclim_resolution,
+  path = bioclim_dir
+)
+
+# Preview first bioclim variable
+plot(bioclim_rasters[[1]], main = "BIO1: Annual Mean Temperature")
+```
+
+## Read and Clean Coordinate Data
+
+```{r}
+# Read input data
+obs_data <- read.csv(input_file, header = TRUE)
+
+# Check required columns
+if (!all(c("Latitude", "Longitude") %in% colnames(obs_data))) {
+  stop("Input file must contain 'Latitude' and 'Longitude' columns (case-sensitive)")
+}
+
+cat("Original data dimensions:", nrow(obs_data), "rows x", ncol(obs_data), "columns\n")
+
+# Remove rows with missing coordinates
+obs_data <- obs_data[complete.cases(obs_data[, c("Longitude", "Latitude")]), ]
+cat("After removing NA coordinates:", nrow(obs_data), "rows\n")
+
+# Remove duplicate coordinates
+dups <- duplicated(obs_data[, c("Longitude", "Latitude")])
+cat("Duplicate coordinates found:", sum(dups), "\n")
+obs_data <- obs_data[!dups, ]
+cat("After removing duplicates:", nrow(obs_data), "rows\n\n")
+
+# Display coordinate summary
+cat("Coordinate ranges:\n")
+cat("  Latitude: ", min(obs_data$Latitude), "to", max(obs_data$Latitude), "\n")
+cat("  Longitude:", min(obs_data$Longitude), "to", max(obs_data$Longitude), "\n\n")
+
+head(obs_data[, c("Longitude", "Latitude")])
+```
+
+## Visualize Points on World Map
+
+```{r, fig.width=12, fig.height=6}
+# Get world map
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+# Create plot
+ggplot() +
+  geom_sf(data = world, fill = "gray95", color = "gray40", linewidth = 0.3) +
+  geom_point(
+    data = obs_data,
+    aes(x = Longitude, y = Latitude),
+    color = "red",
+    size = 2,
+    alpha = 0.6
+  ) +
+  coord_sf(expand = FALSE) +
+  theme_minimal() +
+  labs(
+    title = "Geographic Distribution of Sample Locations",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme(
+    panel.background = element_rect(fill = "aliceblue"),
+    panel.grid = element_line(color = "gray80", linewidth = 0.2)
+  )
+```
+
+## Zoomed View (Optional)
+
+Automatically zooms to the extent of your data points.
+
+```{r, fig.width=10, fig.height=8}
+# Calculate extent with buffer
+lon_range <- range(obs_data$Longitude)
+lat_range <- range(obs_data$Latitude)
+lon_buffer <- diff(lon_range) * 0.1
+lat_buffer <- diff(lat_range) * 0.1
+
+ggplot() +
+  geom_sf(data = world, fill = "gray95", color = "gray40", linewidth = 0.3) +
+  geom_point(
+    data = obs_data,
+    aes(x = Longitude, y = Latitude),
+    color = "darkred",
+    size = 3,
+    alpha = 0.7
+  ) +
+  coord_sf(
+    xlim = c(lon_range[1] - lon_buffer, lon_range[2] + lon_buffer),
+    ylim = c(lat_range[1] - lat_buffer, lat_range[2] + lat_buffer),
+    expand = FALSE
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Sample Locations (Zoomed)",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme(
+    panel.background = element_rect(fill = "aliceblue"),
+    panel.grid = element_line(color = "gray80", linewidth = 0.2)
+  )
+```
+
+## Extract Bioclim Values
+
+```{r}
+# Convert coordinates to spatial points
+coords_only <- obs_data[, c("Longitude", "Latitude")]
+points_sv <- vect(coords_only, geom = c("Longitude", "Latitude"), crs = crs(bioclim_rasters))
+
+# Extract bioclim values at each point
+bioclim_values <- extract(bioclim_rasters, points_sv)
+
+# Prepare final dataset
+if (!is.null(id_column) && id_column %in% colnames(obs_data)) {
+  # Include ID column if specified and exists
+  final_data <- cbind(
+    obs_data[, c(id_column, "Longitude", "Latitude")],
+    bioclim_values[, -1]  # Remove terra's internal ID column
+  )
+} else {
+  # Just coordinates
+  final_data <- cbind(
+    coords_only,
+    bioclim_values[, -1]
+  )
+}
+
+# Display summary
+cat("Extracted bioclim data dimensions:", nrow(final_data), "rows x", ncol(final_data), "columns\n")
+cat("\nBioclim variables extracted:\n")
+cat(paste(colnames(final_data)[-(1:ncol(coords_only))], collapse = ", "), "\n\n")
+
+head(final_data)
+```
+
+## Save Results
+
+```{r}
+# Write to CSV
+write.csv(final_data, output_file, row.names = FALSE)
+
+cat("Results saved to:", output_file, "\n")
+cat("Total locations processed:", nrow(final_data), "\n")
+```
+
+## Bioclim Variable Descriptions
+
+The 19 bioclim variables are:
+
+- **BIO1**: Annual Mean Temperature
+- **BIO2**: Mean Diurnal Range
+- **BIO3**: Isothermality
+- **BIO4**: Temperature Seasonality
+- **BIO5**: Max Temperature of Warmest Month
+- **BIO6**: Min Temperature of Coldest Month
+- **BIO7**: Temperature Annual Range
+- **BIO8**: Mean Temperature of Wettest Quarter
+- **BIO9**: Mean Temperature of Driest Quarter
+- **BIO10**: Mean Temperature of Warmest Quarter
+- **BIO11**: Mean Temperature of Coldest Quarter
+- **BIO12**: Annual Precipitation
+- **BIO13**: Precipitation of Wettest Month
+- **BIO14**: Precipitation of Driest Month
+- **BIO15**: Precipitation Seasonality
+- **BIO16**: Precipitation of Wettest Quarter
+- **BIO17**: Precipitation of Driest Quarter
+- **BIO18**: Precipitation of Warmest Quarter
+- **BIO19**: Precipitation of Coldest Quarter
+
+---
+
+**Session Info**
+
+```{r}
+sessionInfo()
+```
