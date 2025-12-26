@@ -1,0 +1,712 @@
+---
+title: "Calculate BLUEs for GWAS from Multi-Environment Trials"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    theme: cosmo
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+## Overview
+
+This analysis calculates **Best Linear Unbiased Estimates (BLUEs)** for multiple traits from multi-environment trial data, typically for use in Genome-Wide Association Studies (GWAS).
+
+**Key Features:**
+
+- BLUEs calculated across all environments (primary GWAS input)
+- Environment-specific BLUEs for each location
+- Broad-sense heritability estimates for trait quality assessment
+- Variance component decomposition
+- Automatic filtering of high-heritability traits
+
+## Methods
+
+### BLUE Calculation Model
+
+**Across all environments:**
+
+$$Y_{ijk} = \mu + G_i + E_j + R_{jk} + \epsilon_{ijk}$$
+
+Where:
+- $Y_{ijk}$ = observed phenotype
+- $\mu$ = overall mean
+- $G_i$ = **fixed** genotype effect (what we want to estimate)
+- $E_j$ = random environment effect
+- $R_{jk}$ = random replicate effect within environment
+- $\epsilon_{ijk}$ = residual error
+
+**For individual environments:**
+
+$$Y_{ik} = \mu + G_i + R_k + \epsilon_{ik}$$
+
+### Heritability Calculation
+
+Broad-sense heritability across environments:
+
+$$H^2 = \frac{\sigma^2_G}{\sigma^2_G + \frac{\sigma^2_E}{n_E} + \frac{\sigma^2_{Rep}}{n_E \times n_{Rep}} + \frac{\sigma^2_e}{n_E \times n_{Rep}}}$$
+
+## Configuration
+
+**Edit these parameters for your data:**
+
+```{r config}
+# ============================================
+# INPUT DATA CONFIGURATION
+# ============================================
+
+# Input CSV file with phenotype data
+input_file <- "your_data.csv"
+
+# Column names for experimental design
+accession_col <- "accession"      # Genotype/line/accession identifier
+environment_col <- "environment"  # Environment/location/trial name
+rep_col <- "rep"                  # Replicate/block number
+
+# ============================================
+# OUTPUT CONFIGURATION
+# ============================================
+
+# Output file prefix
+output_prefix <- "BLUEs"
+
+# Heritability threshold for high-quality traits
+h2_threshold <- 0.3
+
+# ============================================
+# ANALYSIS OPTIONS
+# ============================================
+
+# Calculate environment-specific BLUEs?
+calc_env_specific <- TRUE
+
+# Calculate heritability?
+calc_heritability <- TRUE
+```
+
+## Load Required Libraries
+
+```{r libraries}
+# Load required packages
+required_packages <- c("lme4", "emmeans", "dplyr", "purrr", "ggplot2", "tidyr", "knitr")
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop("Required package '", pkg, "' is not installed.\n",
+         "Please install it with: install.packages('", pkg, "')")
+  }
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}
+
+cat("All libraries loaded successfully.\n")
+```
+
+## Load and Validate Data
+
+```{r load_data}
+# Check if input file exists
+if (!file.exists(input_file)) {
+  stop("Error: Input file '", input_file, "' not found!")
+}
+
+# Read data
+data <- read.csv(input_file, na.strings = c("NA", ".", ""))
+
+cat("Data loaded successfully!\n")
+cat("Dimensions:", nrow(data), "rows x", ncol(data), "columns\n\n")
+
+# Verify required columns exist
+required_cols <- c(accession_col, environment_col, rep_col)
+missing_cols <- setdiff(required_cols, names(data))
+
+if (length(missing_cols) > 0) {
+  stop("Error: Missing required columns: ", paste(missing_cols, collapse = ", "))
+}
+
+# Get trait names (all columns EXCEPT the design columns)
+trait_names <- setdiff(names(data), required_cols)
+
+cat("Found", length(trait_names), "trait columns\n")
+cat("Traits:", paste(head(trait_names, 10), collapse = ", "), 
+    if(length(trait_names) > 10) "..." else "", "\n\n")
+
+# Convert design factors to factors
+data[[accession_col]] <- as.factor(data[[accession_col]])
+data[[environment_col]] <- as.factor(data[[environment_col]])
+data[[rep_col]] <- as.factor(data[[rep_col]])
+
+# Display experimental design summary
+cat("Experimental Design Summary:\n")
+cat("  Accessions:  ", nlevels(data[[accession_col]]), "\n")
+cat("  Environments:", nlevels(data[[environment_col]]), "\n")
+cat("  Replicates:  ", nlevels(data[[rep_col]]), "\n")
+cat("  Total plots: ", nrow(data), "\n\n")
+
+# Show first few rows
+cat("Data preview:\n")
+print(head(data))
+```
+
+## Calculate BLUEs Across All Environments
+
+BLUEs calculated with genotype as fixed effect and environment/replicate as random effects.
+
+```{r calculate_blues}
+# Function to calculate BLUEs for one trait
+calc_blues <- function(trait_name) {
+  
+  # Remove missing values for this trait
+  data_clean <- data %>% filter(!is.na(!!sym(trait_name)))
+  
+  # Build formula: genotype FIXED, environment and rep RANDOM
+  formula_str <- paste0(trait_name, " ~ ", accession_col, 
+                       " + (1|", environment_col, ") + (1|", 
+                       environment_col, ":", rep_col, ")")
+  formula <- as.formula(formula_str)
+  
+  # Fit mixed model
+  model <- lmer(formula, data = data_clean, REML = TRUE)
+  
+  # Extract BLUEs (Best Linear Unbiased Estimates)
+  blues <- emmeans(model, specs = accession_col)
+  blues_df <- as.data.frame(blues)
+  
+  # Create clean output
+  blues_clean <- data.frame(
+    accession = blues_df[[accession_col]],
+    value = blues_df$emmean
+  )
+  names(blues_clean) <- c(accession_col, trait_name)
+  
+  return(blues_clean)
+}
+
+# Calculate BLUEs for all traits
+cat("Calculating BLUEs across all environments for", length(trait_names), "traits...\n\n")
+blues_list <- list()
+
+# Progress bar
+pb <- txtProgressBar(min = 0, max = length(trait_names), style = 3)
+
+for (i in seq_along(trait_names)) {
+  trait <- trait_names[i]
+  
+  tryCatch({
+    blues_list[[i]] <- calc_blues(trait)
+  }, error = function(e) {
+    cat("\n  ERROR with", trait, ":", e$message, "\n")
+    blues_list[[i]] <- NULL
+  })
+  
+  setTxtProgressBar(pb, i)
+}
+
+close(pb)
+
+# Remove NULL entries (failed traits)
+blues_list <- blues_list[!sapply(blues_list, is.null)]
+
+# Combine all traits into one dataframe
+blues_all <- reduce(blues_list, left_join, by = accession_col)
+
+cat("\n\nBLUEs calculation complete!\n")
+cat("Successfully calculated BLUEs for:", ncol(blues_all) - 1, "traits\n")
+cat("Accessions:", nrow(blues_all), "\n")
+```
+
+### BLUEs Summary
+
+```{r blues_summary}
+# Summary statistics for BLUEs
+cat("\nBLUEs Data Structure:\n")
+cat("  Accessions: ", nrow(blues_all), "\n")
+cat("  Traits:     ", ncol(blues_all) - 1, "\n\n")
+
+# Show first few BLUEs
+cat("First few BLUEs:\n")
+print(head(blues_all))
+```
+
+## Calculate Heritability
+
+```{r calculate_heritability, eval=calc_heritability}
+if (calc_heritability) {
+  
+  # Function to calculate heritability for one trait
+  calc_h2 <- function(trait_name) {
+    
+    data_clean <- data %>% filter(!is.na(!!sym(trait_name)))
+    
+    # Build formula with accession as RANDOM for variance components
+    formula_str <- paste0(trait_name, " ~ (1|", accession_col, 
+                         ") + (1|", environment_col, ") + (1|", 
+                         environment_col, ":", rep_col, ")")
+    formula <- as.formula(formula_str)
+    
+    # Fit model
+    model <- lmer(formula, data = data_clean, REML = TRUE)
+    
+    # Extract variance components
+    vc <- as.data.frame(VarCorr(model))
+    var_g <- vc$vcov[vc$grp == accession_col]
+    var_env <- vc$vcov[vc$grp == environment_col]
+    var_rep <- vc$vcov[grepl(":", vc$grp) & grepl(environment_col, vc$grp)]
+    var_e <- vc$vcov[vc$grp == "Residual"]
+    
+    # Handle missing components
+    if (length(var_g) == 0) var_g <- 0
+    if (length(var_env) == 0) var_env <- 0
+    if (length(var_rep) == 0) var_rep <- 0
+    if (length(var_e) == 0) var_e <- 0
+    
+    # Calculate broad-sense heritability
+    n_env <- length(unique(data_clean[[environment_col]]))
+    n_rep <- length(unique(data_clean[[rep_col]]))
+    h2 <- var_g / (var_g + var_env/n_env + var_rep/(n_env*n_rep) + var_e/(n_env*n_rep))
+    
+    return(data.frame(
+      trait = trait_name,
+      h2 = round(h2, 3),
+      var_genotype = round(var_g, 4),
+      var_environment = round(var_env, 4),
+      var_rep = round(var_rep, 4),
+      var_residual = round(var_e, 4)
+    ))
+  }
+  
+  # Calculate heritability for all traits
+  cat("Calculating heritabilities...\n\n")
+  h2_list <- list()
+  
+  # Progress bar
+  pb <- txtProgressBar(min = 0, max = length(trait_names), style = 3)
+  
+  for (i in seq_along(trait_names)) {
+    trait <- trait_names[i]
+    
+    tryCatch({
+      h2_list[[i]] <- calc_h2(trait)
+    }, error = function(e) {
+      cat("\n  ERROR with", trait, ":", e$message, "\n")
+      h2_list[[i]] <- NULL
+    })
+    
+    setTxtProgressBar(pb, i)
+  }
+  
+  close(pb)
+  
+  # Combine results
+  h2_all <- bind_rows(h2_list)
+  
+  cat("\n\nHeritability calculation complete!\n")
+  cat("Traits analyzed:", nrow(h2_all), "\n")
+}
+```
+
+### Heritability Summary
+
+```{r heritability_summary, eval=calc_heritability}
+if (calc_heritability && exists("h2_all") && nrow(h2_all) > 0) {
+  
+  cat("\nHeritability Statistics:\n")
+  cat("==========================================\n")
+  cat("Mean H²:   ", round(mean(h2_all$h2, na.rm = TRUE), 3), "\n")
+  cat("Median H²: ", round(median(h2_all$h2, na.rm = TRUE), 3), "\n")
+  cat("Range:     ", round(min(h2_all$h2, na.rm = TRUE), 3), "-", 
+      round(max(h2_all$h2, na.rm = TRUE), 3), "\n")
+  cat("Traits with H² >", h2_threshold, ":", 
+      sum(!is.na(h2_all$h2) & h2_all$h2 > h2_threshold), "\n")
+  cat("==========================================\n\n")
+  
+  # Top 10 traits by heritability
+  cat("Top 10 Traits by Heritability:\n")
+  print(h2_all %>% arrange(desc(h2)) %>% head(10))
+}
+```
+
+### Heritability Distribution
+
+```{r plot_heritability, eval=calc_heritability, fig.width=10, fig.height=6}
+if (calc_heritability && exists("h2_all") && nrow(h2_all) > 0) {
+  
+  ggplot(h2_all, aes(x = h2)) +
+    geom_histogram(bins = 30, fill = "steelblue", color = "black", alpha = 0.7) +
+    geom_vline(xintercept = h2_threshold, color = "red", linetype = "dashed", size = 1) +
+    labs(
+      title = "Distribution of Broad-Sense Heritability",
+      subtitle = paste0("Red line indicates H² threshold of ", h2_threshold),
+      x = "Broad-Sense Heritability (H²)",
+      y = "Number of Traits"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      plot.subtitle = element_text(hjust = 0.5, size = 11, color = "gray50"),
+      axis.text = element_text(size = 11),
+      axis.title = element_text(size = 12)
+    )
+}
+```
+
+### Variance Component Decomposition
+
+```{r plot_variance_components, eval=calc_heritability, fig.width=12, fig.height=8}
+if (calc_heritability && exists("h2_all") && nrow(h2_all) > 0) {
+  
+  # Prepare data for stacked bar plot
+  var_data <- h2_all %>%
+    select(trait, var_genotype, var_environment, var_rep, var_residual) %>%
+    pivot_longer(cols = starts_with("var_"), 
+                 names_to = "component", 
+                 values_to = "variance") %>%
+    mutate(
+      component = factor(
+        component,
+        levels = c("var_genotype", "var_environment", "var_rep", "var_residual"),
+        labels = c("Genotype", "Environment", "Replicate", "Residual")
+      )
+    )
+  
+  # Calculate total variance for percentage
+  total_var <- h2_all %>%
+    mutate(total = var_genotype + var_environment + var_rep + var_residual) %>%
+    select(trait, total)
+  
+  var_data <- var_data %>%
+    left_join(total_var, by = "trait") %>%
+    mutate(percentage = variance / total * 100)
+  
+  # Sort traits by heritability and take top 20
+  h2_sorted <- h2_all %>% arrange(desc(h2))
+  top_20_traits <- h2_sorted$trait[1:min(20, nrow(h2_sorted))]
+  
+  var_data_top20 <- var_data %>%
+    filter(trait %in% top_20_traits) %>%
+    mutate(trait = factor(trait, levels = rev(top_20_traits)))
+  
+  ggplot(var_data_top20, aes(x = trait, y = percentage, fill = component)) +
+    geom_bar(stat = "identity", position = "stack") +
+    coord_flip() +
+    scale_fill_manual(
+      values = c(
+        "Genotype" = "#2ecc71",
+        "Environment" = "#e74c3c",
+        "Replicate" = "#f39c12",
+        "Residual" = "#95a5a6"
+      )
+    ) +
+    labs(
+      title = "Variance Component Decomposition (Top 20 Traits by H²)",
+      x = "Trait",
+      y = "Percentage of Total Variance (%)",
+      fill = "Component"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      axis.text = element_text(size = 10),
+      axis.title = element_text(size = 12),
+      legend.position = "top"
+    )
+}
+```
+
+## Calculate Environment-Specific BLUEs
+
+```{r calculate_env_blues, eval=calc_env_specific}
+if (calc_env_specific) {
+  
+  # Function to calculate BLUEs for one environment
+  calc_blues_by_env <- function(trait_name, env) {
+    
+    # Filter data for this environment and trait
+    data_env <- data %>% 
+      filter(!!sym(environment_col) == env) %>%
+      filter(!is.na(!!sym(trait_name)))
+    
+    # Build formula - accession fixed, rep random
+    formula_str <- paste0(trait_name, " ~ ", accession_col, " + (1|", rep_col, ")")
+    formula <- as.formula(formula_str)
+    
+    # Fit mixed model
+    model <- lmer(formula, data = data_env, REML = TRUE)
+    
+    # Extract BLUEs
+    blues <- emmeans(model, specs = accession_col)
+    blues_df <- as.data.frame(blues)
+    
+    # Create clean output
+    blues_clean <- data.frame(
+      accession = blues_df[[accession_col]],
+      value = blues_df$emmean
+    )
+    names(blues_clean) <- c(accession_col, trait_name)
+    
+    return(blues_clean)
+  }
+  
+  # Get unique environments
+  environments <- levels(data[[environment_col]])
+  cat("\nCalculating BLUEs for each environment separately...\n")
+  cat("Environments found:", paste(environments, collapse = ", "), "\n\n")
+  
+  # Calculate BLUEs for each environment
+  blues_by_env <- list()
+  
+  for (env in environments) {
+    cat("Processing environment:", env, "\n")
+    
+    env_blues_list <- list()
+    
+    for (i in seq_along(trait_names)) {
+      trait <- trait_names[i]
+      
+      tryCatch({
+        env_blues_list[[i]] <- calc_blues_by_env(trait, env)
+      }, error = function(e) {
+        # Silent error handling for individual traits
+        env_blues_list[[i]] <- NULL
+      })
+    }
+    
+    # Remove NULL entries
+    env_blues_list <- env_blues_list[!sapply(env_blues_list, is.null)]
+    
+    # Combine all traits for this environment
+    if (length(env_blues_list) > 0) {
+      blues_by_env[[env]] <- reduce(env_blues_list, left_join, by = accession_col)
+      cat("  Completed:", env, "-", ncol(blues_by_env[[env]]) - 1, "traits\n")
+    }
+  }
+  
+  cat("\nEnvironment-specific BLUEs calculation complete!\n")
+}
+```
+
+### Environment-Specific Summary
+
+```{r env_blues_summary, eval=calc_env_specific}
+if (calc_env_specific && exists("blues_by_env") && length(blues_by_env) > 0) {
+  
+  cat("\nEnvironment-Specific BLUEs Summary:\n")
+  cat("==========================================\n")
+  
+  for (env in names(blues_by_env)) {
+    cat(env, ":\n")
+    cat("  Accessions: ", nrow(blues_by_env[[env]]), "\n")
+    cat("  Traits:     ", ncol(blues_by_env[[env]]) - 1, "\n\n")
+  }
+}
+```
+
+## High Heritability Traits
+
+Traits with H² > `r h2_threshold` are considered high-quality for GWAS.
+
+```{r high_h2_traits, eval=calc_heritability}
+if (calc_heritability && exists("h2_all") && nrow(h2_all) > 0) {
+  
+  high_h2_traits <- h2_all %>% 
+    filter(h2 > h2_threshold) %>% 
+    arrange(desc(h2))
+  
+  cat("\nTraits with H² >", h2_threshold, ":\n")
+  cat("==========================================\n")
+  
+  if (nrow(high_h2_traits) > 0) {
+    print(high_h2_traits)
+    
+    # Extract BLUEs for high heritability traits only
+    blues_high_h2 <- blues_all[, c(accession_col, high_h2_traits$trait)]
+    
+    cat("\n", nrow(high_h2_traits), "high-heritability traits identified\n")
+  } else {
+    cat("No traits with H² >", h2_threshold, "\n")
+  }
+}
+```
+
+## Correlation Analysis
+
+Correlation between BLUEs across traits.
+
+```{r correlation_analysis, fig.width=12, fig.height=10}
+# Calculate correlation matrix for BLUEs (exclude accession column)
+blues_numeric <- blues_all %>% select(-all_of(accession_col))
+
+if (ncol(blues_numeric) > 1 && ncol(blues_numeric) <= 50) {
+  
+  cor_matrix <- cor(blues_numeric, use = "pairwise.complete.obs")
+  
+  # Convert to long format for ggplot
+  cor_long <- as.data.frame(as.table(cor_matrix))
+  names(cor_long) <- c("Trait1", "Trait2", "Correlation")
+  
+  ggplot(cor_long, aes(x = Trait1, y = Trait2, fill = Correlation)) +
+    geom_tile() +
+    scale_fill_gradient2(
+      low = "blue", 
+      mid = "white", 
+      high = "red",
+      midpoint = 0,
+      limits = c(-1, 1)
+    ) +
+    labs(
+      title = "Correlation Heatmap of BLUEs",
+      x = "",
+      y = ""
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+      axis.text.y = element_text(size = 8),
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14)
+    )
+  
+} else if (ncol(blues_numeric) > 50) {
+  cat("Too many traits (", ncol(blues_numeric), ") for correlation heatmap visualization.\n")
+  cat("Correlation matrix calculated but not displayed.\n")
+} else {
+  cat("Not enough traits for correlation analysis.\n")
+}
+```
+
+## Save Results
+
+```{r save_results}
+# Create output directory if needed
+output_dir <- dirname(output_prefix)
+if (output_dir != "." && !dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# Export main BLUEs file (for GWAS)
+main_blues_file <- paste0(output_prefix, "_for_GWAS.csv")
+write.csv(blues_all, main_blues_file, row.names = FALSE)
+cat("Saved:", main_blues_file, "\n")
+
+# Export environment-specific BLUEs
+if (calc_env_specific && exists("blues_by_env") && length(blues_by_env) > 0) {
+  for (env in names(blues_by_env)) {
+    env_file <- paste0(output_prefix, "_", env, ".csv")
+    write.csv(blues_by_env[[env]], env_file, row.names = FALSE)
+    cat("Saved:", env_file, "\n")
+  }
+}
+
+# Export heritabilities
+if (calc_heritability && exists("h2_all") && nrow(h2_all) > 0) {
+  h2_file <- paste0(output_prefix, "_heritabilities.csv")
+  write.csv(h2_all, h2_file, row.names = FALSE)
+  cat("Saved:", h2_file, "\n")
+}
+
+# Export high heritability BLUEs
+if (calc_heritability && exists("high_h2_traits") && nrow(high_h2_traits) > 0) {
+  high_h2_file <- paste0(output_prefix, "_high_heritability.csv")
+  write.csv(blues_high_h2, high_h2_file, row.names = FALSE)
+  cat("Saved:", high_h2_file, "\n")
+}
+```
+
+## Final Summary
+
+```{r final_summary}
+cat("\n================================================================================\n")
+cat("BLUE CALCULATION COMPLETE!\n")
+cat("================================================================================\n")
+cat("Input file:              ", input_file, "\n")
+cat("Accessions analyzed:     ", nrow(blues_all), "\n")
+cat("Total traits processed:  ", length(trait_names), "\n")
+cat("Traits with BLUEs:       ", ncol(blues_all) - 1, "\n")
+
+if (calc_heritability && exists("h2_all") && nrow(h2_all) > 0) {
+  cat("\nHeritability Statistics:\n")
+  cat("  Mean H²:               ", round(mean(h2_all$h2, na.rm = TRUE), 3), "\n")
+  cat("  Traits with H² >", h2_threshold, ":", 
+      sum(!is.na(h2_all$h2) & h2_all$h2 > h2_threshold), "\n")
+}
+
+if (calc_env_specific && exists("blues_by_env") && length(blues_by_env) > 0) {
+  cat("\nEnvironments analyzed:   ", length(blues_by_env), "\n")
+  for (env in names(blues_by_env)) {
+    cat("  ", env, ": ", ncol(blues_by_env[[env]]) - 1, " traits\n", sep = "")
+  }
+}
+
+cat("\nOutput files created:\n")
+cat("  - ", main_blues_file, "\n", sep = "")
+
+if (calc_env_specific && exists("blues_by_env") && length(blues_by_env) > 0) {
+  for (env in names(blues_by_env)) {
+    cat("  - ", output_prefix, "_", env, ".csv\n", sep = "")
+  }
+}
+
+if (calc_heritability && exists("h2_all") && nrow(h2_all) > 0) {
+  cat("  - ", output_prefix, "_heritabilities.csv\n", sep = "")
+}
+
+if (calc_heritability && exists("high_h2_traits") && nrow(high_h2_traits) > 0) {
+  cat("  - ", output_prefix, "_high_heritability.csv\n", sep = "")
+}
+
+cat("================================================================================\n")
+```
+
+## Session Information
+
+```{r session_info}
+sessionInfo()
+```
+
+---
+
+## Notes for GWAS
+
+**Using BLUEs in GWAS:**
+
+1. **Primary file**: `BLUEs_for_GWAS.csv` contains BLUEs across all environments
+   - This is the standard input for GWAS software
+   - Rows = accessions, Columns = traits
+
+2. **Quality filtering**: Consider using only high-heritability traits (H² > 0.3)
+   - These traits have better genetic signal
+   - Reduces multiple testing burden
+   - File: `BLUEs_high_heritability.csv`
+
+3. **Environment-specific GWAS**: Individual environment files allow detection of:
+   - Environment-specific QTL
+   - Genotype × Environment interactions
+   - Local adaptation signals
+
+**Recommended GWAS workflow:**
+
+1. Start with high-heritability traits from `BLUEs_high_heritability.csv`
+2. Run genome-wide scan with appropriate population structure correction
+3. For significant associations, validate across individual environments
+4. Check if variance components suggest strong G×E interactions
+
+**File format compatibility:**
+
+- Most GWAS software (GAPIT, TASSEL, GEMMA, etc.) accepts CSV format
+- Ensure accession IDs match exactly with genotype file
+- Missing data (NA) is acceptable in trait columns
