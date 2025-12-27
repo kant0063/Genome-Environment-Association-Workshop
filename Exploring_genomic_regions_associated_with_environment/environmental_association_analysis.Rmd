@@ -1,0 +1,1072 @@
+---
+title: "Environmental Association Analysis"
+subtitle: "Generic workflow for analyzing environmental GWAS results"
+author: "Your Name"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 6,
+  dpi = 300
+)
+```
+
+# Overview
+
+This workflow analyzes environmental association (eGWAS) results to identify genomic regions associated with environmental adaptation. The analysis includes:
+
+- Comparison of significant eGWAS markers with population genetic statistics (F~ST~, SPA)
+- Gene annotation proximity analysis
+- Permutation testing to assess enrichment
+- Visualization of results
+
+**Key outputs:**
+
+1. Summary statistics of significant environmental associations
+2. Comparison of eGWAS hits with F~ST~ and SPA outliers
+3. Gene proximity analysis for significant markers
+4. Figures comparing eGWAS markers to random background sets
+
+---
+
+# Configuration
+
+## Species-Specific Parameters
+
+**IMPORTANT:** Update these parameters for your species before running the analysis.
+
+```{r config}
+# ==============================================================================
+# SPECIES CONFIGURATION - UPDATE THESE FOR YOUR DATASET
+# ==============================================================================
+
+# Project identifier (used in file naming)
+species_name <- "YourSpecies"  # e.g., "Cranberry", "Pepper", "Lentil"
+
+# FDR threshold for significance
+fdr_threshold <- 0.20  # Adjust based on your study design
+
+# Linkage disequilibrium decay distance (bp)
+# This is the distance at which LD decays to r^2 = 0.2 in your species
+# Estimate from LD decay analysis or use literature values
+ld_decay_distance <- 17000  # bp; UPDATE THIS FOR YOUR SPECIES
+
+# Model selection approach
+# Options: "best_lambda", "manual", "all_models"
+model_selection <- "best_lambda"  
+# If "manual", specify which model to use:
+manual_model <- "model2"  # e.g., "model1", "model2", "model3"
+
+# Population category for wild/native germplasm
+# This should match the category name in your metadata
+wild_category <- "Wild"  # e.g., "Wild", "Landrace", "Native"
+
+# Outlier percentile threshold (for SPA and FST)
+outlier_percentile <- 0.999  # Top 0.1% of markers
+
+# Number of permutations for significance testing
+n_permutations <- 10000
+
+# GFF annotation file (set to NULL if not available)
+gff_file_name <- "species_annotations.gff"  # or NULL
+
+# ==============================================================================
+```
+
+## Load Required Packages
+
+```{r load-packages}
+# Core analysis packages
+library(tidyverse)
+library(sommer)
+
+# Genomic data handling
+library(raster)
+library(readxl)
+
+# Statistical analysis
+library(qvalue)
+library(slider)
+
+# Visualization
+library(patchwork)
+library(cowplot)
+library(ggplot2)
+
+# Optional packages (comment out if not available)
+# library(neyhart)  # For custom color palettes
+# library(snps)     # For SNP-specific operations
+# library(LDheatmap) # For LD heatmaps
+
+# Custom functions
+source("startup.R")  # Load your custom startup script if available
+```
+
+## Define File Paths
+
+```{r file-paths}
+# ==============================================================================
+# FILE PATH CONFIGURATION
+# ==============================================================================
+
+# Base directories
+if (!exists("data_dir")) {
+  data_dir <- "data"  # Directory with input data
+}
+if (!exists("result_dir")) {
+  result_dir <- "results"  # Directory for saving results
+}
+if (!exists("fig_dir")) {
+  fig_dir <- "figures"  # Directory for saving figures
+}
+
+# Create output directories if they don't exist
+dir.create(result_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Input files
+# These should be RData files containing the required objects
+# Adjust the file names to match your naming convention
+metadata_file <- file.path(data_dir, "population_metadata_and_genotypes.RData")
+climate_file <- file.path(data_dir, "germplasm_origin_bioclim_data.RData")
+gwas_results_file <- file.path(result_dir, "eaa_gwas_results.RData")
+popgen_results_file <- file.path(result_dir, "population_genetics_stats.RData")
+
+# GFF annotation file (if available)
+if (!is.null(gff_file_name)) {
+  gff_file <- file.path(data_dir, gff_file_name)
+}
+
+# ==============================================================================
+```
+
+---
+
+# Data Loading
+
+## Load Genomic and Environmental Data
+
+```{r load-data}
+# Load population metadata and genotypes
+# Expected objects: pop_metadata, geno_mat_*, geno_hmp_*, snp_info, K_wild
+load(metadata_file)
+
+# Load environmental/climate data
+# Expected objects: eaa_environmental_data, eaa_environmental_vars
+load(climate_file)
+
+# Load eGWAS results
+# Expected objects: gwas_out, p_lambda, eaa_gwas_sigmar, eaa_environmental_vars
+load(gwas_results_file)
+
+# Load population genetics results
+# Expected objects: global_marker_fst, spa_out
+load(popgen_results_file)
+
+cat("Data loaded successfully!\n")
+```
+
+## Data Structure Check
+
+```{r check-data}
+# Verify that required objects exist
+required_objects <- c(
+  "pop_metadata", "snp_info", "gwas_out", 
+  "global_marker_fst", "spa_out"
+)
+
+missing_objects <- required_objects[!sapply(required_objects, exists)]
+
+if (length(missing_objects) > 0) {
+  stop("Missing required objects: ", paste(missing_objects, collapse = ", "))
+}
+
+cat("All required data objects present.\n")
+cat("\nDataset dimensions:\n")
+cat("  SNPs:", nrow(snp_info), "\n")
+cat("  Individuals:", nrow(pop_metadata), "\n")
+cat("  GWAS results:", nrow(gwas_out), "\n")
+cat("  FST values:", nrow(global_marker_fst), "\n")
+cat("  SPA scores:", nrow(spa_out), "\n")
+```
+
+---
+
+# Data Preparation
+
+## Prepare Genotype Matrices
+
+```{r prep-genotypes}
+# Select the appropriate filtered genotype matrices
+# Adjust these variable names to match your naming convention
+# Common patterns: geno_mat_wild_filter3, geno_mat_wild_final, etc.
+
+# Find available genotype matrix objects
+geno_mat_objects <- ls(pattern = "^geno_mat_.*wild.*filter")
+geno_hmp_objects <- ls(pattern = "^geno_hmp_.*wild.*filter")
+
+if (length(geno_mat_objects) > 0) {
+  # Use the last (most filtered) version
+  geno_mat_wild <- get(sort(geno_mat_objects, decreasing = TRUE)[1])
+  cat("Using genotype matrix:", sort(geno_mat_objects, decreasing = TRUE)[1], "\n")
+} else {
+  stop("No filtered wild genotype matrix found. Expected pattern: geno_mat_*wild*filter*")
+}
+
+if (length(geno_hmp_objects) > 0) {
+  geno_hmp_wild <- get(sort(geno_hmp_objects, decreasing = TRUE)[1])
+  cat("Using hapmap format:", sort(geno_hmp_objects, decreasing = TRUE)[1], "\n")
+} else {
+  stop("No filtered wild hapmap found. Expected pattern: geno_hmp_*wild*filter*")
+}
+
+# Also prepare all-individuals matrix if available
+geno_mat_all_objects <- ls(pattern = "^geno_mat_all.*filter")
+if (length(geno_mat_all_objects) > 0) {
+  geno_mat_all <- get(sort(geno_mat_all_objects, decreasing = TRUE)[1])
+}
+```
+
+## Prepare Environmental Data
+
+```{r prep-environmental}
+# Center and scale environmental variables if not already done
+if (exists("eaa_environmental_vars") && exists("eaa_environmental_data")) {
+  
+  eaa_environmental_data1 <- eaa_environmental_data %>%
+    select(location_abbr, all_of(eaa_environmental_vars$variable))
+  
+  cat("Environmental variables prepared:", ncol(eaa_environmental_data1) - 1, "\n")
+  
+} else {
+  cat("Warning: Environmental data not found or already prepared.\n")
+}
+```
+
+## Prepare Bioclimate Data for Analysis
+
+```{r prep-bioclim}
+# Prepare bioclimate data matched to genetic samples
+germplasm_bioclim_data <- pop_metadata %>%
+  filter(category == wild_category, !is.na(latitude)) %>%
+  select(individual, latitude, longitude) %>%
+  left_join(., eaa_environmental_data1, by = c("individual" = "location_abbr")) %>%
+  as.data.frame() %>%
+  filter(individual %in% colnames(K_wild))
+
+cat("Individuals with both genetic and environmental data:", nrow(germplasm_bioclim_data), "\n")
+```
+
+## Prepare Marker Data
+
+```{r prep-markers}
+# Subset genotype matrix to individuals with environmental data
+geno_mat_wild1 <- geno_mat_wild[germplasm_bioclim_data$individual, ]
+
+# Subset hapmap format
+geno_hmp_wild1 <- geno_hmp_wild %>%
+  select(marker:alleles, row.names(geno_mat_wild1))
+
+# Prepare SNP info in standard format
+snp_info1 <- snp_info %>%
+  rename(Locus = marker, LG = chrom, Position = pos) %>%
+  as.data.frame()
+
+# Split marker matrix by chromosome
+geno_mat_list <- geno_hmp_wild %>%
+  select(marker, chrom) %>%
+  split(.$chrom) %>% 
+  map("marker") %>%
+  map(~geno_mat_wild1[, .x, drop = FALSE])
+
+# Prepare genotype data for downstream analysis
+geno <- geno_hmp_wild %>%
+  select(marker, chrom, pos, all_of(colnames(K_wild))) %>%
+  mutate(across(all_of(colnames(K_wild)), ~. - 1)) %>%
+  as.data.frame()
+
+cat("Marker data prepared.\n")
+cat("  Chromosomes:", length(unique(snp_info1$LG)), "\n")
+cat("  Markers:", nrow(geno_hmp_wild1), "\n")
+```
+
+---
+
+# Model Selection and Significant Markers
+
+## Select Best GWAS Model
+
+```{r model-selection}
+if (model_selection == "best_lambda") {
+  
+  # Use the model with best genomic inflation factor (lambda)
+  if (exists("p_lambda") && "best_model" %in% names(p_lambda)) {
+    
+    gwas_out_best_model <- gwas_out %>%
+      inner_join(., subset(p_lambda, best_model == "*", c(model, variable), drop = TRUE))
+    
+    # Show model selection
+    cat("Best models by environmental variable:\n")
+    print(xtabs(~ model, p_lambda, subset = best_model == "*"))
+    
+  } else {
+    warning("p_lambda object not found or doesn't have best_model column. Using all models.")
+    gwas_out_best_model <- gwas_out
+  }
+  
+} else if (model_selection == "manual") {
+  
+  # Use manually specified model
+  gwas_out_best_model <- gwas_out %>% 
+    filter(model == manual_model)
+  
+  cat("Using manually selected model:", manual_model, "\n")
+  
+} else if (model_selection == "all_models") {
+  
+  # Use all models
+  gwas_out_best_model <- gwas_out
+  cat("Using all models.\n")
+  
+}
+
+cat("GWAS results after model selection:", nrow(gwas_out_best_model), "\n")
+```
+
+## Extract Significant Markers
+
+```{r extract-sigmar}
+# Extract significant markers based on FDR threshold
+# This should have been generated in the GWAS analysis
+if (exists("eaa_gwas_sigmar")) {
+  egwas_sigmar <- eaa_gwas_sigmar
+} else {
+  # If not pre-computed, calculate from GWAS results
+  egwas_sigmar <- gwas_out_best_model %>%
+    group_by(variable) %>%
+    mutate(qvalue = qvalue(pvalue)$qvalues) %>%
+    filter(qvalue <= fdr_threshold) %>%
+    ungroup()
+}
+
+# Summary statistics
+n_total_assoc <- nrow(egwas_sigmar)
+n_unique_markers <- n_distinct(egwas_sigmar$marker)
+n_unique_vars <- n_distinct(egwas_sigmar$variable)
+
+cat("\n=== Significant Association Summary ===\n")
+cat("Total associations (marker-variable pairs):", n_total_assoc, "\n")
+cat("Unique markers:", n_unique_markers, "\n")
+cat("Environmental variables with associations:", n_unique_vars, "\n")
+```
+
+## Significant Markers by Environmental Variable
+
+```{r sigmar-by-variable}
+# Number of unique markers per environmental variable
+sigmar_per_var <- egwas_sigmar %>%
+  left_join(., select(eaa_environmental_vars, -class)) %>%
+  group_by(full_name, variable) %>%
+  summarize(n_markers = n_distinct(marker), .groups = "drop") %>%
+  arrange(desc(n_markers))
+
+cat("\nTop environmental variables by number of significant markers:\n")
+print(head(sigmar_per_var, 10))
+
+# Create a bar plot
+if (nrow(sigmar_per_var) > 0) {
+  ggplot(sigmar_per_var, aes(x = reorder(full_name, n_markers), y = n_markers)) +
+    geom_col(fill = "steelblue") +
+    coord_flip() +
+    labs(
+      title = "Significant Markers per Environmental Variable",
+      x = "Environmental Variable",
+      y = "Number of Significant Markers"
+    ) +
+    theme_minimal()
+}
+```
+
+## Markers by Environmental Variable Class
+
+```{r sigmar-by-class}
+# Check if environmental variable classes are available
+if ("class" %in% names(eaa_environmental_vars)) {
+  
+  # Identify variables of interest (if pre-defined)
+  if (exists("env_variables_of_interest")) {
+    egwas_sigmar_cat <- egwas_sigmar %>%
+      left_join(., eaa_environmental_vars) %>%
+      filter(variable %in% env_variables_of_interest)
+  } else {
+    egwas_sigmar_cat <- egwas_sigmar %>%
+      left_join(., eaa_environmental_vars)
+  }
+  
+  # Summarize by class
+  sigmar_by_class <- egwas_sigmar_cat %>%
+    group_by(class, variable) %>%
+    summarize(nSigMar = n(), .groups = "drop_last") %>%
+    summarize(
+      nVariable = n_distinct(variable), 
+      nSigMar = sum(nSigMar),
+      .groups = "drop"
+    )
+  
+  cat("\nSignificant markers by environmental variable class:\n")
+  print(sigmar_by_class)
+  
+  # Visualize
+  ggplot(sigmar_by_class, aes(x = reorder(class, nSigMar), y = nSigMar)) +
+    geom_col(aes(fill = class), show.legend = FALSE) +
+    coord_flip() +
+    labs(
+      title = "Significant Markers by Environmental Class",
+      x = "Environmental Class",
+      y = "Number of Marker-Variable Associations"
+    ) +
+    theme_minimal()
+  
+} else {
+  cat("\nEnvironmental variable classes not available.\n")
+}
+```
+
+## Characterize Significant Markers
+
+```{r characterize-sigmar}
+# How many environmental variables does each marker associate with?
+egwas_sigmar_unique <- egwas_sigmar %>%
+  select(marker, variable) %>%
+  group_by(marker) %>%
+  summarize(
+    nVar = n(),
+    variables = paste(variable, collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(nVar))
+
+cat("\nMarkers with most environmental associations:\n")
+print(head(egwas_sigmar_unique, 10))
+
+# Distribution of associations per marker
+ggplot(egwas_sigmar_unique, aes(x = nVar)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "white") +
+  labs(
+    title = "Distribution of Environmental Associations per Marker",
+    x = "Number of Environmental Variables",
+    y = "Number of Markers"
+  ) +
+  theme_minimal()
+```
+
+---
+
+# Comparison with Population Genetic Outliers
+
+## Identify SPA and F~ST~ Outliers
+
+```{r identify-outliers}
+# Calculate quantile thresholds
+spa_threshold <- quantile(spa_out$spa_score, outlier_percentile)
+fst_threshold <- quantile(global_marker_fst$Fst, outlier_percentile)
+
+# Identify outliers
+spa_outliers <- spa_out %>%
+  filter(spa_score >= spa_threshold)
+
+fst_outliers <- global_marker_fst %>%
+  filter(Fst >= fst_threshold)
+
+cat("\n=== Population Genetic Outlier Summary ===\n")
+cat("SPA outliers (top", (1 - outlier_percentile) * 100, "%):", nrow(spa_outliers), "\n")
+cat("FST outliers (top", (1 - outlier_percentile) * 100, "%):", nrow(fst_outliers), "\n")
+cat("Overlap between FST and SPA outliers:", 
+    length(intersect(fst_outliers$marker, spa_outliers$marker)), "\n")
+```
+
+## Compare eGWAS Markers with SPA Scores
+
+```{r egwas-spa}
+# Get SPA scores for significant GWAS markers
+eaa_gwas_spa_scores <- egwas_sigmar %>%
+  distinct(marker) %>%
+  left_join(., select(spa_out, marker, spa_score))
+
+# How many eGWAS markers are also SPA outliers?
+n_egwas_spa_overlap <- sum(eaa_gwas_spa_scores$spa_score >= spa_threshold)
+
+cat("\neGWAS markers that are also SPA outliers:", n_egwas_spa_overlap, "\n")
+
+if (n_egwas_spa_overlap > 0) {
+  cat("\nThese markers are:\n")
+  print(
+    eaa_gwas_spa_scores %>%
+      filter(spa_score >= spa_threshold) %>%
+      arrange(desc(spa_score))
+  )
+}
+
+# Calculate mean SPA score for eGWAS markers
+gwas_mean_spa <- mean(eaa_gwas_spa_scores$spa_score)
+gwas_sd_spa <- sd(eaa_gwas_spa_scores$spa_score)
+
+cat("\nMean SPA score for eGWAS markers:", round(gwas_mean_spa, 4), 
+    "± ", round(gwas_sd_spa, 4), "\n")
+cat("Mean SPA score for all markers:", round(mean(spa_out$spa_score), 4), 
+    "± ", round(sd(spa_out$spa_score), 4), "\n")
+```
+
+## Permutation Test: eGWAS vs Random Markers (SPA)
+
+```{r permute-spa}
+# Number of eGWAS markers
+n_eaa_markers <- nrow(eaa_gwas_spa_scores)
+
+# Exclude eGWAS markers from background
+spa_out_nogwas_vec <- spa_out %>%
+  filter(!marker %in% eaa_gwas_spa_scores$marker) %>%
+  pull(spa_score)
+
+# Permutation test
+set.seed(209)
+random_snps_spa <- replicate(
+  n = n_permutations, 
+  mean(sample(x = spa_out_nogwas_vec, size = n_eaa_markers))
+)
+
+# Calculate empirical p-value
+p_value_spa <- mean(random_snps_spa >= gwas_mean_spa)
+
+cat("\n=== Permutation Test Results (SPA) ===\n")
+cat("Empirical p-value:", round(p_value_spa, 4), "\n")
+
+# Wilcoxon test
+wilcox_result_spa <- wilcox.test(
+  x = eaa_gwas_spa_scores$spa_score, 
+  y = spa_out_nogwas_vec
+)
+
+cat("Wilcoxon test p-value:", format.pval(wilcox_result_spa$p.value, digits = 3), "\n")
+```
+
+## Visualize SPA Permutation Results
+
+```{r plot-spa-permutation, fig.height=4, fig.width=6}
+# Create plotting data
+plot_data_spa <- tibble(spa_score = random_snps_spa)
+
+# Create plot
+g_random_eaa_spa <- ggplot(plot_data_spa, aes(x = spa_score)) +
+  geom_histogram(bins = 50, fill = "gray70", color = "white") +
+  geom_vline(xintercept = gwas_mean_spa, color = "blue", linewidth = 1) +
+  annotate(
+    "text", 
+    x = gwas_mean_spa, 
+    y = Inf, 
+    label = "EAA significant\nSNPs", 
+    color = "blue",
+    hjust = -0.1, 
+    vjust = 1.5, 
+    size = 3.5
+  ) +
+  annotate(
+    "text",
+    x = min(random_snps_spa),
+    y = Inf,
+    label = paste0("Random sets of\n", n_eaa_markers, " SNPs"),
+    color = "gray40",
+    hjust = 0,
+    vjust = 1.5,
+    size = 3.5
+  ) +
+  labs(
+    title = "EAA Markers vs Random Background: SPA Scores",
+    subtitle = paste0("Permutation test p-value = ", round(p_value_spa, 4)),
+    x = "Mean SPA Score",
+    y = "Frequency"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+print(g_random_eaa_spa)
+
+# Save figure
+ggsave(
+  filename = paste0(species_name, "_eaaSPA_versus_randomSPA.png"), 
+  plot = g_random_eaa_spa, 
+  path = fig_dir,
+  height = 4, 
+  width = 6, 
+  dpi = 300
+)
+```
+
+## Compare eGWAS Markers with F~ST~ Values
+
+```{r egwas-fst}
+# Get FST values for significant GWAS markers
+eaa_gwas_fst <- egwas_sigmar %>%
+  distinct(marker) %>%
+  left_join(., select(global_marker_fst, marker, Fst))
+
+# How many eGWAS markers are also FST outliers?
+n_egwas_fst_overlap <- sum(eaa_gwas_fst$Fst >= fst_threshold, na.rm = TRUE)
+
+cat("\neGWAS markers that are also FST outliers:", n_egwas_fst_overlap, "\n")
+
+if (n_egwas_fst_overlap > 0) {
+  cat("\nThese markers are:\n")
+  print(
+    eaa_gwas_fst %>%
+      filter(Fst >= fst_threshold) %>%
+      arrange(desc(Fst))
+  )
+}
+
+# Calculate mean FST for eGWAS markers
+gwas_mean_fst <- mean(eaa_gwas_fst$Fst, na.rm = TRUE)
+gwas_sd_fst <- sd(eaa_gwas_fst$Fst, na.rm = TRUE)
+
+cat("\nMean FST for eGWAS markers:", round(gwas_mean_fst, 4), 
+    "± ", round(gwas_sd_fst, 4), "\n")
+cat("Mean FST for all markers:", round(mean(global_marker_fst$Fst, na.rm = TRUE), 4), 
+    "± ", round(sd(global_marker_fst$Fst, na.rm = TRUE), 4), "\n")
+```
+
+## Permutation Test: eGWAS vs Random Markers (F~ST~)
+
+```{r permute-fst}
+# Number of eGWAS markers
+n_eaa_markers_fst <- nrow(eaa_gwas_fst)
+
+# Exclude eGWAS markers from background
+fst_nogwas_vec <- global_marker_fst %>%
+  filter(!marker %in% eaa_gwas_fst$marker) %>%
+  pull(Fst)
+
+# Permutation test
+set.seed(209)
+random_snps_fst <- replicate(
+  n = n_permutations, 
+  mean(sample(x = fst_nogwas_vec, size = n_eaa_markers_fst))
+)
+
+# Calculate empirical p-value
+p_value_fst <- mean(random_snps_fst >= gwas_mean_fst)
+
+cat("\n=== Permutation Test Results (FST) ===\n")
+cat("Empirical p-value:", format.pval(p_value_fst, digits = 3), "\n")
+
+# Wilcoxon test
+wilcox_result_fst <- wilcox.test(
+  x = eaa_gwas_fst$Fst, 
+  y = fst_nogwas_vec
+)
+
+cat("Wilcoxon test p-value:", format.pval(wilcox_result_fst$p.value, digits = 3), "\n")
+```
+
+## Visualize F~ST~ Permutation Results
+
+```{r plot-fst-permutation, fig.height=4, fig.width=6}
+# Create plotting data
+plot_data_fst <- tibble(fst = random_snps_fst)
+
+# Create plot
+g_random_eaa_fst <- ggplot(plot_data_fst, aes(x = fst)) +
+  geom_histogram(bins = 50, fill = "gray70", color = "white") +
+  geom_vline(xintercept = gwas_mean_fst, color = "red", linewidth = 1) +
+  annotate(
+    "text", 
+    x = gwas_mean_fst, 
+    y = Inf, 
+    label = "EAA significant\nSNPs", 
+    color = "red",
+    hjust = 1.1, 
+    vjust = 1.5, 
+    size = 3.5
+  ) +
+  annotate(
+    "text",
+    x = min(random_snps_fst),
+    y = Inf,
+    label = paste0("Random sets of\n", n_eaa_markers, " SNPs"),
+    color = "gray40",
+    hjust = 0,
+    vjust = 1.5,
+    size = 3.5
+  ) +
+  labs(
+    title = expression("EAA Markers vs Random Background:" ~ italic(F)[ST] ~ "Values"),
+    subtitle = paste0("Permutation test p-value ", 
+                     ifelse(p_value_fst < 0.001, "< 0.001", 
+                           paste("=", round(p_value_fst, 4)))),
+    x = expression('Mean' ~ italic(F)[ST]),
+    y = "Frequency"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+print(g_random_eaa_fst)
+
+# Save figure
+ggsave(
+  filename = paste0(species_name, "_eaaFST_versus_randomFST.png"), 
+  plot = g_random_eaa_fst, 
+  path = fig_dir,
+  height = 4, 
+  width = 6, 
+  dpi = 300
+)
+```
+
+## Correlation Between GWAS Scores and Population Statistics
+
+```{r gwas-correlations}
+# Correlation between eGWAS p-values and SPA scores
+egwas_score_spa <- gwas_out_best_model %>%
+  filter(variable %in% unique(egwas_sigmar$variable)) %>%
+  left_join(., select(spa_out, marker, spa_score)) %>%
+  group_by(variable) %>%
+  summarize(
+    spa_egwas_cor = cor(sqrt(score), spa_score, use = "complete.obs"),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(abs(spa_egwas_cor)))
+
+cat("\nCorrelation between eGWAS test statistics and SPA scores:\n")
+print(head(egwas_score_spa, 10))
+
+# Correlation between eGWAS p-values and FST
+egwas_score_fst <- gwas_out_best_model %>%
+  filter(variable %in% unique(egwas_sigmar$variable)) %>%
+  left_join(., select(global_marker_fst, marker, Fst)) %>%
+  group_by(variable) %>%
+  summarize(
+    fst_egwas_cor = cor(sqrt(score), Fst, use = "complete.obs"),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(abs(fst_egwas_cor)))
+
+cat("\nCorrelation between eGWAS test statistics and FST:\n")
+print(head(egwas_score_fst, 10))
+```
+
+---
+
+# Gene Annotation Analysis
+
+This section requires a GFF annotation file for your species.
+
+```{r gene-annotation, eval = !is.null(gff_file_name)}
+# Check if GFF file exists
+if (!is.null(gff_file_name) && file.exists(gff_file)) {
+  
+  cat("\n=== Gene Annotation Analysis ===\n")
+  cat("Loading GFF file:", gff_file, "\n")
+  
+  # Read GFF file
+  species_gff <- ape::read.gff(file = gff_file)
+  
+  cat("GFF entries loaded:", nrow(species_gff), "\n")
+  
+  # Combine all significant markers (eGWAS, FST, SPA)
+  all_sigmars <- bind_rows(
+    mutate(egwas_sigmar, class = "EAA", variable = variable),
+    mutate(fst_outliers, variable = "Fst", class = "Fst"),
+    mutate(spa_outliers, variable = "SPA", class = "SPA")
+  ) %>% 
+    select(class, variable, marker, chrom, pos)
+  
+  cat("Total significant markers across all analyses:", nrow(all_sigmars), "\n")
+  
+} else {
+  cat("\nGFF annotation file not available. Skipping gene annotation analysis.\n")
+}
+```
+
+## Find Genes Near Significant Markers
+
+```{r find-nearby-genes, eval = !is.null(gff_file_name)}
+if (!is.null(gff_file_name) && file.exists(gff_file)) {
+  
+  # Analyze each significant marker for nearby genes
+  all_sigmar_nearby_annotation <- all_sigmars %>%
+    group_by(class, variable, marker) %>%
+    group_modify(~ {
+      row <- .x
+      
+      # Get marker location
+      snp_info_i <- snp_info %>% filter(marker == row$marker[1])
+      
+      # Find annotations within this SNP
+      snp_i_within_annotation <- species_gff %>%
+        filter(
+          seqid == as.character(snp_info_i$chrom),
+          type != "chromosome"
+        ) %>%
+        filter(
+          (start <= snp_info_i$pos & end >= snp_info_i$pos) | 
+          (start >= snp_info_i$pos & end <= snp_info_i$pos)
+        )
+      
+      # Find annotations near this SNP (within LD decay distance)
+      sigmar_nearby_ann <- species_gff %>%
+        filter(
+          seqid == as.character(snp_info_i$chrom), 
+          type != "chromosome"
+        ) %>%
+        filter(
+          abs(snp_info_i$pos - start) <= ld_decay_distance | 
+          abs(snp_info_i$pos - end) <= ld_decay_distance
+        ) %>%
+        mutate(
+          start_distance = abs(start - snp_info_i$pos),
+          end_distance = abs(end - snp_info_i$pos),
+          min_distance = pmin(start_distance, end_distance)
+        ) %>%
+        arrange(min_distance)
+      
+      tibble(
+        nearby_annotation = list(sigmar_nearby_ann),
+        within_annotations = list(snp_i_within_annotation)
+      )
+    }) %>%
+    ungroup() %>%
+    mutate(region = ifelse(map_int(within_annotations, nrow) > 0, "genic", "non-genic"))
+  
+  cat("\nSignificant markers by genomic region:\n")
+  print(table(all_sigmar_nearby_annotation$region))
+  
+  # Count markers with nearby genes
+  markers_with_genes <- all_sigmar_nearby_annotation %>%
+    filter(map_int(nearby_annotation, nrow) > 0)
+  
+  cat("\nSignificant markers with nearby genes (within", ld_decay_distance, "bp):", 
+      nrow(markers_with_genes), "\n")
+  
+}
+```
+
+## Analyze All Markers for Comparison
+
+```{r analyze-all-markers, eval = !is.null(gff_file_name)}
+if (!is.null(gff_file_name) && file.exists(gff_file)) {
+  
+  # Analyze all markers for comparison
+  all_markers_nearby_annotation <- snp_info %>%
+    group_by(marker) %>%
+    group_modify(~ {
+      snp_info_i <- .x
+      
+      # Find annotations within this SNP
+      snp_i_within_annotation <- species_gff %>%
+        filter(
+          seqid == as.character(snp_info_i$chrom),
+          type != "chromosome"
+        ) %>%
+        filter(
+          (start <= snp_info_i$pos & end >= snp_info_i$pos) | 
+          (start >= snp_info_i$pos & end <= snp_info_i$pos)
+        )
+      
+      # Find annotations near this SNP
+      sigmar_nearby_ann <- species_gff %>%
+        filter(
+          seqid == as.character(snp_info_i$chrom), 
+          type != "chromosome"
+        ) %>%
+        filter(
+          abs(snp_info_i$pos - start) <= ld_decay_distance | 
+          abs(snp_info_i$pos - end) <= ld_decay_distance
+        ) %>%
+        mutate(
+          start_distance = abs(start - snp_info_i$pos),
+          end_distance = abs(end - snp_info_i$pos),
+          min_distance = pmin(start_distance, end_distance)
+        ) %>%
+        arrange(min_distance)
+      
+      # Get minimum distance to nearest gene
+      gene_distances <- sigmar_nearby_ann %>%
+        filter(type == "gene") %>%
+        pull(min_distance)
+      
+      tibble(
+        min_distance_nearby_gene = ifelse(
+          length(gene_distances) > 0, 
+          min(gene_distances), 
+          NA_real_
+        ),
+        region = ifelse(nrow(snp_i_within_annotation) == 0, "non-genic", "genic")
+      )
+    }) %>%
+    ungroup()
+  
+  cat("\nAll markers by genomic region:\n")
+  print(table(all_markers_nearby_annotation$region))
+  
+}
+```
+
+## Compare Genic Enrichment
+
+```{r compare-genic-enrichment, eval = !is.null(gff_file_name)}
+if (!is.null(gff_file_name) && file.exists(gff_file)) {
+  
+  # Proportion of genic SNPs in significant vs all SNPs
+  prop_genic_sigmar <- all_sigmar_nearby_annotation %>%
+    distinct(marker, region) %>%
+    pull(region) %>%
+    table() %>%
+    prop.table()
+  
+  prop_genic_all <- all_markers_nearby_annotation %>%
+    distinct(marker, region) %>%
+    pull(region) %>%
+    table() %>%
+    prop.table()
+  
+  cat("\n=== Genic Region Enrichment ===\n")
+  cat("\nSignificant markers:\n")
+  print(round(prop_genic_sigmar, 3))
+  
+  cat("\nAll markers:\n")
+  print(round(prop_genic_all, 3))
+  
+  # Chi-square test for enrichment
+  genic_table <- rbind(
+    table(all_sigmar_nearby_annotation %>% 
+            distinct(marker, region) %>% 
+            pull(region)),
+    table(all_markers_nearby_annotation %>% 
+            distinct(marker, region) %>% 
+            pull(region))
+  )
+  rownames(genic_table) <- c("Significant", "All")
+  
+  cat("\nContingency table:\n")
+  print(genic_table)
+  
+  if (all(dim(genic_table) == c(2, 2))) {
+    chisq_result <- chisq.test(genic_table)
+    cat("\nChi-square test p-value:", format.pval(chisq_result$p.value, digits = 3), "\n")
+  }
+  
+}
+```
+
+---
+
+# Save Results
+
+```{r save-results}
+# Create list of results to save
+results_to_save <- c(
+  "egwas_sigmar",
+  "eaa_gwas_spa_scores",
+  "eaa_gwas_fst",
+  "spa_outliers",
+  "fst_outliers",
+  "gwas_out_best_model",
+  "p_value_spa",
+  "p_value_fst"
+)
+
+# Add annotation results if they exist
+if (exists("all_sigmar_nearby_annotation")) {
+  results_to_save <- c(results_to_save, 
+                       "all_sigmar_nearby_annotation",
+                       "all_markers_nearby_annotation")
+}
+
+# Save results
+output_file <- file.path(result_dir, 
+                        paste0(species_name, "_egwas_analysis_results.RData"))
+
+save(list = results_to_save, file = output_file)
+
+cat("\n=== Results Saved ===\n")
+cat("Output file:", output_file, "\n")
+cat("Objects saved:", length(results_to_save), "\n")
+```
+
+---
+
+# Summary
+
+```{r summary}
+cat("\n")
+cat("=" %R% 70, "\n")
+cat("ENVIRONMENTAL ASSOCIATION ANALYSIS SUMMARY\n")
+cat("=" %R% 70, "\n\n")
+
+cat("Species:", species_name, "\n")
+cat("Analysis date:", format(Sys.Date(), "%B %d, %Y"), "\n\n")
+
+cat("Dataset:\n")
+cat("  Total SNPs:", nrow(snp_info), "\n")
+cat("  Individuals with environmental data:", nrow(germplasm_bioclim_data), "\n\n")
+
+cat("Significant Associations:\n")
+cat("  Total marker-variable associations:", n_total_assoc, "\n")
+cat("  Unique markers:", n_unique_markers, "\n")
+cat("  Environmental variables:", n_unique_vars, "\n\n")
+
+cat("Population Genetic Outliers:\n")
+cat("  SPA outliers:", nrow(spa_outliers), "\n")
+cat("  FST outliers:", nrow(fst_outliers), "\n")
+cat("  eGWAS markers that are SPA outliers:", n_egwas_spa_overlap, "\n")
+cat("  eGWAS markers that are FST outliers:", n_egwas_fst_overlap, "\n\n")
+
+cat("Statistical Tests:\n")
+cat("  SPA permutation test p-value:", round(p_value_spa, 4), "\n")
+cat("  FST permutation test p-value:", 
+    ifelse(p_value_fst < 0.001, "< 0.001", round(p_value_fst, 4)), "\n\n")
+
+if (exists("all_sigmar_nearby_annotation")) {
+  cat("Gene Annotation:\n")
+  cat("  LD decay distance used:", ld_decay_distance, "bp\n")
+  cat("  Significant markers in genic regions:", 
+      sum(all_sigmar_nearby_annotation$region == "genic"), "\n")
+  cat("  Significant markers with nearby genes:", 
+      nrow(markers_with_genes), "\n\n")
+}
+
+cat("Output Files:\n")
+cat("  Results:", basename(output_file), "\n")
+cat("  Figure 1:", paste0(species_name, "_eaaSPA_versus_randomSPA.png"), "\n")
+cat("  Figure 2:", paste0(species_name, "_eaaFST_versus_randomFST.png"), "\n")
+
+cat("\n")
+cat("=" %R% 70, "\n")
+```
+
+---
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
