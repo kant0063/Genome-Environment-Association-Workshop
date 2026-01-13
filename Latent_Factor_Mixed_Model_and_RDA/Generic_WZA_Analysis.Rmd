@@ -1,0 +1,801 @@
+---
+title: "Weighted Z-score Analysis (WZA) for Environmental Association"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 12,
+  fig.height = 6
+)
+```
+
+## Overview
+
+**Weighted Z-score Analysis (WZA)** combines genetic-environment association (GEA) signals across multiple environmental variables to identify loci under selection.
+
+**Reference:** Booker et al. (2021) - [https://github.com/TBooker/WZA](https://github.com/TBooker/WZA)
+
+### Method
+
+1. For each SNP: calculate z-scores from GEA tests with each environmental variable
+2. Weight z-scores by R² (strength of association)  
+3. **WZA score** = sum(|z| × R²) / sum(R²)
+
+### Requirements
+
+- **VCF file** with genotypes
+- **Metadata file** with:
+  - Sample IDs matching VCF
+  - Population/group labels
+  - Environmental variables (continuous numeric)
+
+---
+
+## Configuration
+
+**Modify these parameters for your dataset:**
+
+```{r config}
+################################################################################
+# USER CONFIGURATION
+################################################################################
+
+# Input files
+VCF_FILE <- "your_genotypes.vcf"  # VCF or VCF.gz format
+METADATA_FILE <- "your_metadata.csv"
+
+# Column names in metadata
+SAMPLE_COL <- "Sample_ID"      # Column with sample identifiers
+POP_COL <- "Population"        # Column with population/group labels
+
+# Environmental variables
+# Provide a vector of column names from your metadata file
+ENV_VARS <- c("bio_01", "bio_02", "bio_05", "bio_12", "bio_15")
+# Examples:
+# - Bioclimatic: c("bio_01", "bio_12", "bio_15")
+# - Custom: c("temperature", "precipitation", "elevation")
+# - All matching pattern: grep("^bio_", colnames(metadata), value = TRUE)
+
+# Analysis parameters
+MIN_MAF <- 0.05              # Minimum minor allele frequency (0.05 = 5%)
+MIN_SAMPLES <- 20            # Minimum samples required for regression
+OUTLIER_PERCENTILE <- 0.99   # Top X% threshold for outliers (0.99 = top 1%)
+
+# Output prefix for all files
+OUTPUT_PREFIX <- "WZA_results"
+
+# Number of top SNPs to display in report
+N_TOP_SNPS <- 10
+```
+
+---
+
+## Load Required Libraries
+
+```{r libraries}
+################################################################################
+# LOAD LIBRARIES
+################################################################################
+
+# Check and install missing packages
+required_packages <- c("vcfR", "dplyr", "tidyr", "ggplot2")
+
+for (pkg in required_packages) {
+  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+cat("All required packages loaded successfully\n")
+```
+
+---
+
+## Define Helper Functions
+
+```{r functions}
+################################################################################
+# HELPER FUNCTIONS
+################################################################################
+
+# Calculate minor allele frequency
+calc_maf <- function(geno) {
+  # geno should be 0, 1, 2 (or NA/9 for missing)
+  geno_clean <- geno[!is.na(geno) & geno != 9]
+  if (length(geno_clean) == 0) return(NA)
+  
+  # Allele frequency
+  p <- sum(geno_clean) / (2 * length(geno_clean))
+  # Minor allele frequency
+  min(p, 1 - p)
+}
+
+# Calculate z-score from linear regression
+calc_z_score <- function(genotypes, environment) {
+  # Remove missing data
+  keep <- !is.na(genotypes) & !is.na(environment)
+  
+  if (sum(keep) < MIN_SAMPLES) {
+    return(list(z = NA, r2 = NA, p = NA))
+  }
+  
+  g <- genotypes[keep]
+  e <- environment[keep]
+  
+  # Linear regression: environment ~ genotype
+  fit <- tryCatch({
+    lm(e ~ g)
+  }, error = function(err) {
+    return(NULL)
+  })
+  
+  if (is.null(fit)) {
+    return(list(z = NA, r2 = NA, p = NA))
+  }
+  
+  # Extract results
+  coef_summary <- summary(fit)$coefficients
+  
+  if (nrow(coef_summary) < 2) {
+    return(list(z = NA, r2 = NA, p = NA))
+  }
+  
+  # Z-score = coefficient / standard error
+  beta <- coef_summary[2, "Estimate"]
+  se <- coef_summary[2, "Std. Error"]
+  z <- beta / se
+  
+  # P-value and R-squared
+  p <- coef_summary[2, "Pr(>|t|)"]
+  r2 <- summary(fit)$r.squared
+  
+  list(z = z, r2 = r2, p = p)
+}
+
+# Calculate WZA score for a single SNP across all environments
+calc_wza <- function(genotypes, env_matrix) {
+  # env_matrix: samples × environmental variables
+  
+  results <- lapply(1:ncol(env_matrix), function(i) {
+    calc_z_score(genotypes, env_matrix[, i])
+  })
+  
+  # Extract z-scores and R² values
+  z_scores <- sapply(results, function(x) x$z)
+  r2_values <- sapply(results, function(x) x$r2)
+  p_values <- sapply(results, function(x) x$p)
+  
+  # Remove NA values
+  valid <- !is.na(z_scores) & !is.na(r2_values)
+  
+  if (sum(valid) == 0) {
+    return(list(
+      wza = NA,
+      mean_abs_z = NA,
+      max_abs_z = NA,
+      sum_r2 = NA,
+      n_sig = NA
+    ))
+  }
+  
+  z_valid <- z_scores[valid]
+  r2_valid <- r2_values[valid]
+  p_valid <- p_values[valid]
+  
+  # WZA score: weighted mean of absolute z-scores
+  abs_z <- abs(z_valid)
+  
+  if (sum(r2_valid) > 0) {
+    wza <- sum(abs_z * r2_valid) / sum(r2_valid)
+  } else {
+    wza <- mean(abs_z)
+  }
+  
+  # Additional metrics
+  mean_abs_z <- mean(abs_z)
+  max_abs_z <- max(abs_z)
+  sum_r2 <- sum(r2_valid)
+  n_sig <- sum(p_valid < 0.05, na.rm = TRUE)
+  
+  list(
+    wza = wza,
+    mean_abs_z = mean_abs_z,
+    max_abs_z = max_abs_z,
+    sum_r2 = sum_r2,
+    n_sig = n_sig
+  )
+}
+
+cat("Helper functions defined\n")
+```
+
+---
+
+## Load Data
+
+### Load VCF File
+
+```{r load_vcf}
+################################################################################
+# LOAD VCF
+################################################################################
+
+cat("Loading VCF:", VCF_FILE, "\n")
+
+if (!file.exists(VCF_FILE)) {
+  stop("VCF file not found: ", VCF_FILE)
+}
+
+vcf <- read.vcfR(VCF_FILE, verbose = FALSE)
+
+cat(sprintf("Successfully loaded: %s SNPs, %s samples\n", 
+            format(nrow(vcf@fix), big.mark = ","),
+            ncol(vcf@gt) - 1))
+
+# Extract genotype matrix (as numeric: 0, 1, 2)
+gt <- extract.gt(vcf, element = "GT", as.numeric = TRUE)
+gt <- t(gt)  # Transpose to samples × SNPs
+
+# Get SNP information
+snp_data <- data.frame(
+  SNP_index = 1:ncol(gt),
+  CHROM = vcf@fix[, "CHROM"],
+  POS = as.numeric(vcf@fix[, "POS"]),
+  stringsAsFactors = FALSE
+)
+
+cat("\nFirst few samples:", paste(head(rownames(gt), 5), collapse = ", "), "\n")
+```
+
+### Load Metadata
+
+```{r load_metadata}
+################################################################################
+# LOAD METADATA
+################################################################################
+
+cat("\nLoading metadata:", METADATA_FILE, "\n")
+
+if (!file.exists(METADATA_FILE)) {
+  stop("Metadata file not found: ", METADATA_FILE)
+}
+
+meta <- read.csv(METADATA_FILE, stringsAsFactors = FALSE, check.names = FALSE)
+
+cat(sprintf("Successfully loaded: %s samples\n", format(nrow(meta), big.mark = ",")))
+
+# Check required columns
+if (!SAMPLE_COL %in% colnames(meta)) {
+  stop("Sample column '", SAMPLE_COL, "' not found in metadata")
+}
+
+if (!POP_COL %in% colnames(meta)) {
+  stop("Population column '", POP_COL, "' not found in metadata")
+}
+
+# Check environmental variables
+env_available <- ENV_VARS[ENV_VARS %in% colnames(meta)]
+
+if (length(env_available) == 0) {
+  stop("No environmental variables found in metadata. Check ENV_VARS configuration.")
+}
+
+cat(sprintf("\nFound %s/%s specified environmental variables:\n", 
+            length(env_available), length(ENV_VARS)))
+cat(paste("  -", env_available, collapse = "\n"), "\n")
+
+if (length(env_available) < length(ENV_VARS)) {
+  missing <- setdiff(ENV_VARS, env_available)
+  cat("\nMissing variables:", paste(missing, collapse = ", "), "\n")
+}
+
+# Display first few rows
+cat("\nFirst few rows of metadata:\n")
+print(head(meta[, c(SAMPLE_COL, POP_COL, env_available)], 3))
+```
+
+---
+
+## Match and Filter Samples
+
+```{r match_samples}
+################################################################################
+# MATCH SAMPLES BETWEEN VCF AND METADATA
+################################################################################
+
+vcf_samples <- rownames(gt)
+meta_samples <- meta[[SAMPLE_COL]]
+
+cat("Matching samples between VCF and metadata...\n\n")
+cat("VCF samples (first 5):\n  ", paste(head(vcf_samples, 5), collapse = ", "), "\n")
+cat("Metadata samples (first 5):\n  ", paste(head(meta_samples, 5), collapse = ", "), "\n\n")
+
+# Find common samples
+common <- intersect(vcf_samples, meta_samples)
+
+cat(sprintf("Matched samples: %s\n", length(common)))
+cat(sprintf("  - In VCF only: %s\n", length(setdiff(vcf_samples, meta_samples))))
+cat(sprintf("  - In metadata only: %s\n", length(setdiff(meta_samples, vcf_samples))))
+
+if (length(common) == 0) {
+  stop("No matching samples found! Check that sample IDs match between VCF and metadata.")
+}
+
+# Subset and align
+gt_matched <- gt[common, ]
+meta_matched <- meta[match(common, meta[[SAMPLE_COL]]), ]
+
+# Verify alignment
+if (!all(rownames(gt_matched) == meta_matched[[SAMPLE_COL]])) {
+  stop("Sample alignment failed!")
+}
+
+cat("\nSamples successfully aligned\n")
+
+# Extract environmental data
+env_data <- meta_matched[, env_available, drop = FALSE]
+
+# Remove samples with missing environmental data
+complete_idx <- complete.cases(env_data)
+
+cat(sprintf("\nFiltering samples with complete environmental data:\n"))
+cat(sprintf("  Keeping: %s/%s samples (%.1f%%)\n", 
+            sum(complete_idx), 
+            length(complete_idx),
+            100 * sum(complete_idx) / length(complete_idx)))
+
+gt_final <- gt_matched[complete_idx, ]
+env_final <- env_data[complete_idx, ]
+meta_final <- meta_matched[complete_idx, ]
+
+# Standardize environmental variables (mean = 0, SD = 1)
+cat("\nStandardizing environmental variables (Z-scores)...\n")
+env_scaled <- scale(env_final)
+
+# Show scaling statistics
+cat("\nEnvironmental variable statistics after scaling:\n")
+env_stats <- data.frame(
+  Variable = colnames(env_scaled),
+  Mean = round(colMeans(env_scaled), 6),
+  SD = round(apply(env_scaled, 2, sd), 6),
+  Min = round(apply(env_scaled, 2, min), 2),
+  Max = round(apply(env_scaled, 2, max), 2)
+)
+print(env_stats, row.names = FALSE)
+```
+
+---
+
+## Filter SNPs by MAF
+
+```{r filter_maf}
+################################################################################
+# FILTER SNPS BY MINOR ALLELE FREQUENCY
+################################################################################
+
+cat(sprintf("\nCalculating MAF (minimum threshold = %.3f)...\n", MIN_MAF))
+
+# Calculate MAF for each SNP
+maf <- apply(gt_final, 2, calc_maf)
+
+# Filter SNPs
+keep_snps <- which(!is.na(maf) & maf >= MIN_MAF)
+
+cat(sprintf("\nKeeping: %s/%s SNPs (%.1f%%)\n", 
+            format(length(keep_snps), big.mark = ","),
+            format(ncol(gt_final), big.mark = ","),
+            100 * length(keep_snps) / ncol(gt_final)))
+
+gt_filtered <- gt_final[, keep_snps]
+snp_filtered <- snp_data[keep_snps, ]
+maf_filtered <- maf[keep_snps]
+
+# MAF distribution
+cat("\nMAF distribution:\n")
+cat(sprintf("  Min:    %.4f\n", min(maf_filtered, na.rm = TRUE)))
+cat(sprintf("  Median: %.4f\n", median(maf_filtered, na.rm = TRUE)))
+cat(sprintf("  Mean:   %.4f\n", mean(maf_filtered, na.rm = TRUE)))
+cat(sprintf("  Max:    %.4f\n", max(maf_filtered, na.rm = TRUE)))
+```
+
+---
+
+## Run WZA Analysis
+
+```{r run_wza}
+################################################################################
+# COMPUTE WZA SCORES
+################################################################################
+
+cat(sprintf("\nComputing WZA scores for %s SNPs...\n", 
+            format(ncol(gt_filtered), big.mark = ",")))
+cat(sprintf("Using %s environmental variables\n", ncol(env_scaled)))
+cat("This may take several minutes depending on dataset size...\n\n")
+
+# Calculate WZA for each SNP
+n_snps <- ncol(gt_filtered)
+progress_interval <- max(1, floor(n_snps / 20))
+
+wza_list <- vector("list", n_snps)
+
+start_time <- Sys.time()
+
+for (i in 1:n_snps) {
+  if (i %% progress_interval == 0) {
+    elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+    rate <- i / elapsed
+    eta <- (n_snps - i) / rate / 60  # minutes
+    
+    cat(sprintf("  Progress: %s/%s (%.1f%%) - ETA: %.1f min\n", 
+                format(i, big.mark = ","),
+                format(n_snps, big.mark = ","),
+                100 * i / n_snps,
+                eta))
+  }
+  
+  wza_list[[i]] <- calc_wza(gt_filtered[, i], env_scaled)
+}
+
+end_time <- Sys.time()
+total_time <- difftime(end_time, start_time, units = "mins")
+
+cat(sprintf("\nAnalysis complete! Total time: %.2f minutes\n", as.numeric(total_time)))
+
+# Compile results
+wza_results <- data.frame(
+  snp_filtered,
+  MAF = maf_filtered,
+  WZA = sapply(wza_list, function(x) x$wza),
+  Mean_abs_Z = sapply(wza_list, function(x) x$mean_abs_z),
+  Max_abs_Z = sapply(wza_list, function(x) x$max_abs_z),
+  Sum_R2 = sapply(wza_list, function(x) x$sum_r2),
+  N_sig_envs = sapply(wza_list, function(x) x$n_sig),
+  stringsAsFactors = FALSE
+)
+
+# Remove SNPs with NA WZA
+wza_results <- wza_results[!is.na(wza_results$WZA), ]
+
+cat(sprintf("\nValid WZA scores: %s SNPs\n", 
+            format(nrow(wza_results), big.mark = ",")))
+```
+
+---
+
+## Identify Outliers
+
+```{r identify_outliers}
+################################################################################
+# IDENTIFY OUTLIER SNPS
+################################################################################
+
+# Calculate outlier threshold
+threshold <- quantile(wza_results$WZA, OUTLIER_PERCENTILE)
+
+wza_results <- wza_results %>%
+  mutate(
+    WZA_rank = rank(-WZA),
+    WZA_percentile = 1 - (WZA_rank / n()),
+    Outlier = WZA >= threshold
+  )
+
+cat(sprintf("\nOutlier threshold (top %.1f%%): %.4f\n", 
+            (1 - OUTLIER_PERCENTILE) * 100, threshold))
+cat(sprintf("Outlier SNPs identified: %s (%.2f%%)\n\n", 
+            sum(wza_results$Outlier),
+            100 * sum(wza_results$Outlier) / nrow(wza_results)))
+
+# WZA score statistics
+cat("WZA score distribution:\n")
+cat(sprintf("  Min:    %.4f\n", min(wza_results$WZA)))
+cat(sprintf("  Q1:     %.4f\n", quantile(wza_results$WZA, 0.25)))
+cat(sprintf("  Median: %.4f\n", median(wza_results$WZA)))
+cat(sprintf("  Mean:   %.4f\n", mean(wza_results$WZA)))
+cat(sprintf("  Q3:     %.4f\n", quantile(wza_results$WZA, 0.75)))
+cat(sprintf("  Max:    %.4f\n", max(wza_results$WZA)))
+cat(sprintf("  SD:     %.4f\n", sd(wza_results$WZA)))
+```
+
+### Top SNPs by WZA Score
+
+```{r top_snps}
+# Display top SNPs
+top_snps <- head(wza_results %>% 
+                   arrange(desc(WZA)) %>%
+                   select(SNP_index, CHROM, POS, WZA, MAF, 
+                          N_sig_envs, Sum_R2, WZA_percentile), 
+                 N_TOP_SNPS)
+
+cat(sprintf("\nTop %d SNPs by WZA score:\n", N_TOP_SNPS))
+print(top_snps, row.names = FALSE)
+```
+
+---
+
+## Visualizations
+
+### Manhattan Plot
+
+```{r manhattan_plot, fig.width=14, fig.height=6}
+################################################################################
+# MANHATTAN PLOT
+################################################################################
+
+# Calculate cumulative positions for plotting
+chrom_summary <- wza_results %>%
+  group_by(CHROM) %>%
+  summarise(
+    max_pos = max(POS),
+    .groups = 'drop'
+  ) %>%
+  arrange(CHROM) %>%
+  mutate(
+    cum_start = cumsum(c(0, head(max_pos, -1))),
+    mid_pos = cum_start + max_pos / 2
+  )
+
+plot_data <- wza_results %>%
+  left_join(chrom_summary %>% select(CHROM, cum_start), by = "CHROM") %>%
+  mutate(
+    pos_plot = cum_start + POS,
+    chrom_color = as.numeric(factor(CHROM)) %% 2
+  )
+
+# Create Manhattan plot
+ggplot(plot_data, aes(x = pos_plot, y = WZA)) +
+  geom_point(aes(color = factor(chrom_color)), alpha = 0.6, size = 1) +
+  geom_hline(yintercept = threshold, color = "red", 
+             linetype = "dashed", linewidth = 0.8) +
+  scale_color_manual(values = c("0" = "#2c3e50", "1" = "#95a5a6"), 
+                     guide = "none") +
+  scale_x_continuous(
+    breaks = chrom_summary$mid_pos,
+    labels = chrom_summary$CHROM,
+    expand = c(0.01, 0.01)
+  ) +
+  labs(
+    title = "WZA Manhattan Plot",
+    subtitle = sprintf("Red line = top %.1f%% threshold (WZA ≥ %.3f)", 
+                       (1 - OUTLIER_PERCENTILE) * 100, threshold),
+    x = "Chromosome",
+    y = "WZA Score"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+### Distribution of WZA Scores
+
+```{r distribution_plot, fig.width=10, fig.height=6}
+################################################################################
+# DISTRIBUTION PLOT
+################################################################################
+
+ggplot(wza_results, aes(x = WZA)) +
+  geom_histogram(bins = 100, fill = "#3498db", color = "black", alpha = 0.7) +
+  geom_vline(xintercept = threshold, color = "red", 
+             linetype = "dashed", linewidth = 1) +
+  geom_vline(xintercept = median(wza_results$WZA), 
+             color = "black", linewidth = 1) +
+  annotate("text", x = threshold, y = Inf, 
+           label = sprintf("  Outlier threshold\n  (%.3f)", threshold),
+           hjust = 0, vjust = 1.5, color = "red", size = 3.5) +
+  annotate("text", x = median(wza_results$WZA), y = Inf,
+           label = sprintf("  Median\n  (%.3f)", median(wza_results$WZA)),
+           hjust = 1.1, vjust = 1.5, color = "black", size = 3.5) +
+  labs(
+    title = "Distribution of WZA Scores",
+    subtitle = "Black = median, Red = outlier threshold",
+    x = "WZA Score",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5)
+  )
+```
+
+### Outliers by Chromosome
+
+```{r chromosome_plot, fig.width=12, fig.height=6}
+################################################################################
+# CHROMOSOME SUMMARY PLOT
+################################################################################
+
+chrom_outliers <- wza_results %>%
+  group_by(CHROM) %>%
+  summarise(
+    Total_SNPs = n(),
+    Outliers = sum(Outlier),
+    Proportion = Outliers / Total_SNPs,
+    .groups = 'drop'
+  )
+
+ggplot(chrom_outliers, aes(x = CHROM, y = Outliers)) +
+  geom_col(fill = "#e74c3c", alpha = 0.8) +
+  geom_text(aes(label = Outliers), vjust = -0.5, size = 3) +
+  labs(
+    title = "WZA Outlier SNPs by Chromosome",
+    subtitle = sprintf("Total outliers: %s", sum(chrom_outliers$Outliers)),
+    x = "Chromosome",
+    y = "Number of Outlier SNPs"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+### WZA vs MAF Relationship
+
+```{r wza_maf_plot, fig.width=10, fig.height=6}
+################################################################################
+# WZA VS MAF PLOT
+################################################################################
+
+ggplot(wza_results, aes(x = MAF, y = WZA)) +
+  geom_point(aes(color = Outlier), alpha = 0.5, size = 1.5) +
+  geom_hline(yintercept = threshold, color = "red", 
+             linetype = "dashed", linewidth = 0.8) +
+  scale_color_manual(values = c("FALSE" = "#95a5a6", "TRUE" = "#e74c3c"),
+                     labels = c("Non-outlier", "Outlier")) +
+  labs(
+    title = "WZA Score vs Minor Allele Frequency",
+    x = "Minor Allele Frequency (MAF)",
+    y = "WZA Score",
+    color = "Classification"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )
+```
+
+---
+
+## Export Results
+
+```{r export_results}
+################################################################################
+# SAVE RESULTS
+################################################################################
+
+# 1. Complete results
+out_complete <- paste0(OUTPUT_PREFIX, "_results.csv")
+write.csv(wza_results, out_complete, row.names = FALSE)
+cat("Saved complete results:", out_complete, "\n")
+
+# 2. Outliers only
+outliers <- wza_results %>%
+  filter(Outlier) %>%
+  arrange(desc(WZA))
+
+out_outliers <- paste0(OUTPUT_PREFIX, "_outliers.csv")
+write.csv(outliers, out_outliers, row.names = FALSE)
+cat(sprintf("Saved outliers: %s (%s SNPs)\n", out_outliers, nrow(outliers)))
+
+# 3. Chromosome summary
+out_chroms <- paste0(OUTPUT_PREFIX, "_chromosome_summary.csv")
+write.csv(chrom_outliers, out_chroms, row.names = FALSE)
+cat("Saved chromosome summary:", out_chroms, "\n")
+
+# 4. Save plots
+ggsave(paste0(OUTPUT_PREFIX, "_manhattan.png"), 
+       width = 14, height = 6, dpi = 300)
+cat("Saved Manhattan plot:", paste0(OUTPUT_PREFIX, "_manhattan.png\n"))
+
+ggsave(paste0(OUTPUT_PREFIX, "_distribution.png"), 
+       width = 10, height = 6, dpi = 300)
+cat("Saved distribution plot:", paste0(OUTPUT_PREFIX, "_distribution.png\n"))
+
+ggsave(paste0(OUTPUT_PREFIX, "_chromosomes.png"), 
+       width = 12, height = 6, dpi = 300)
+cat("Saved chromosome plot:", paste0(OUTPUT_PREFIX, "_chromosomes.png\n"))
+
+ggsave(paste0(OUTPUT_PREFIX, "_wza_vs_maf.png"),
+       width = 10, height = 6, dpi = 300)
+cat("Saved WZA vs MAF plot:", paste0(OUTPUT_PREFIX, "_wza_vs_maf.png\n"))
+```
+
+---
+
+## Summary Statistics
+
+### Overall Summary
+
+```{r summary_stats}
+################################################################################
+# SUMMARY STATISTICS
+################################################################################
+
+cat("\n")
+cat("================================================================================\n")
+cat("ANALYSIS SUMMARY\n")
+cat("================================================================================\n\n")
+
+cat("Dataset:\n")
+cat(sprintf("  Total SNPs analyzed: %s\n", 
+            format(nrow(wza_results), big.mark = ",")))
+cat(sprintf("  Total samples: %s\n", nrow(gt_final)))
+cat(sprintf("  Environmental variables: %s\n", ncol(env_scaled)))
+cat("\n")
+
+cat("Outlier detection:\n")
+cat(sprintf("  Threshold (top %.1f%%): %.4f\n", 
+            (1 - OUTLIER_PERCENTILE) * 100, threshold))
+cat(sprintf("  Outlier SNPs: %s (%.2f%%)\n", 
+            sum(wza_results$Outlier),
+            100 * sum(wza_results$Outlier) / nrow(wza_results)))
+cat("\n")
+
+cat("WZA score range:\n")
+cat(sprintf("  Minimum: %.4f\n", min(wza_results$WZA)))
+cat(sprintf("  Maximum: %.4f\n", max(wza_results$WZA)))
+cat(sprintf("  Mean: %.4f\n", mean(wza_results$WZA)))
+cat(sprintf("  Median: %.4f\n", median(wza_results$WZA)))
+```
+
+### Chromosomes with Most Outliers
+
+```{r top_chromosomes}
+top_chroms <- chrom_outliers %>%
+  arrange(desc(Outliers)) %>%
+  head(10)
+
+cat("\nTop 10 chromosomes by outlier count:\n")
+print(top_chroms, row.names = FALSE)
+```
+
+---
+
+## Session Information
+
+```{r session_info}
+sessionInfo()
+```
+
+---
+
+## Interpretation Guide
+
+### Understanding WZA Scores
+
+- **Higher WZA scores** indicate SNPs with strong, consistent associations across multiple environmental variables
+- **Outlier SNPs** (top 1% by default) are candidates for being under environmental selection
+- **N_sig_envs** shows how many environmental variables had significant associations (p < 0.05)
+- **Sum_R2** indicates the total explanatory power across all environmental variables
+
+### Next Steps
+
+1. **Annotate candidate SNPs**: Identify genes near outlier SNPs
+2. **Validate results**: Test top candidates in independent datasets
+3. **Gene ontology analysis**: Look for enriched biological pathways
+4. **Environmental correlations**: Examine which specific environments drive signals
+5. **Compare methods**: Cross-validate with other GEA approaches (RDA, LFMM, BayPass)
+
+### References
+
+Booker TR, Yeaman S, Whitlock MC (2021) Variation in recombination rate affects detection of outliers in genome scans under neutrality. *Molecular Ecology* 30:4274-4279. [doi:10.1111/mec.16024](https://doi.org/10.1111/mec.16024)
