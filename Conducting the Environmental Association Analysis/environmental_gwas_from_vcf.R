@@ -686,15 +686,32 @@ sig_markers <- gwas_analyzed %>%
     if (length(p_vals) == 0) return(tibble())
     
     # Calculate FDR
-    fdr_result <- sommer:::fdr(p_vals, fdr.level = fdr_threshold)
-    threshold <- fdr_result$fdr.10
+    # Try Storey's q-value first (more powerful for eGWAS); fall back to
+    # Benjamini-Hochberg if pi0 estimation fails (too few markers, weird
+    # p-value distribution, etc.)
+    qobj <- tryCatch(
+      qvalue::qvalue(p_vals),
+      error = function(e) NULL,
+      warning = function(w) NULL
+    )
     
-    sig <- df %>%
-      dplyr::filter(p_value <= threshold) %>%
+    df_with_q <- df %>%
+      dplyr::filter(!is.na(p_value))
+    
+    if (!is.null(qobj)) {
+      df_with_q$q_value <- qobj$qvalues
+      method_used <- "Storey q-value"
+    } else {
+      df_with_q$q_value <- p.adjust(df_with_q$p_value, method = "BH")
+      method_used <- "BH (qvalue fallback)"
+    }
+    
+    sig <- df_with_q %>%
+      dplyr::filter(q_value <= fdr_threshold) %>%
       arrange(p_value)
     
     if (nrow(sig) > 0) {
-      cat("  ", var_name, ":", nrow(sig), "significant markers\n")
+      cat("  ", var_name, ":", nrow(sig), "significant markers [", method_used, "]\n")
     }
     
     return(sig)
