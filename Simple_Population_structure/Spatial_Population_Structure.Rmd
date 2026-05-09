@@ -83,8 +83,8 @@ cat("All required packages loaded successfully\n")
 
 ```{r set-parameters}
 # ==================== INPUT FILES ====================
-VCF_FILE <- "your_genotypes.vcf"                    # Path to VCF file
-COORD_CSV <- "your_coordinates.csv"                 # Path to coordinate CSV
+VCF_FILE <- "your.vcf"                    # Path to VCF file
+COORD_CSV <- "SampleId_Coord.csv"                 # Path to coordinate CSV
 
 # ==================== COORDINATE COLUMNS ====================
 SAMPLE_ID_COLUMN <- "SampleID"                      # Sample ID column name
@@ -92,7 +92,7 @@ LATITUDE_COLUMN <- "Latitude"                       # Latitude column name
 LONGITUDE_COLUMN <- "Longitude"                     # Longitude column name
 
 # ==================== TESS3 PARAMETERS ====================
-K_VALUES <- 1:7                                     # Range of K values to test
+K_VALUES <- 1:10                                     # Range of K values to test
 PLOIDY <- 2                                         # Ploidy level (2 for diploid)
 N_CORES <- 4                                        # Number of CPU cores to use
 
@@ -374,16 +374,129 @@ cat("Elapsed time:", round(elapsed, 2), "minutes\n")
 ```{r extract-cv}
 cat("Extracting cross-validation scores...\n")
 
-# Extract CV scores
-if (!is.null(tess3_obj$crossvalid)) {
-  cv_scores <- tess3_obj$crossvalid
-} else if (!is.null(tess3_obj$rmse)) {
-  cv_scores <- tess3_obj$rmse
-} else {
-  # Manually extract from each K
-  cv_scores <- sapply(K_VALUES, function(k) {
-    tess3_obj[[paste0("K", k)]]$crossvalid
-  })
+# Robust CV extraction across tess3r versions/structures.
+# tess3r returns a list with one element per K (often class "tess3").
+# Each element typically contains $crossvalid or $rmse, sometimes a vector
+# of CV values per repetition. Some versions/configs nest results one or
+# two levels deeper (e.g., $tess3$crossvalid, $results[[k]]$crossvalid,
+# or per-replicate lists when keep = "all").
+
+# Helper: pull a numeric CV/RMSE value from a single element, averaging
+# over replicates if needed. Returns NA_real_ if nothing usable is found.
+pull_cv_value <- function(elem) {
+  if (is.null(elem)) return(NA_real_)
+  
+  # Direct field hits (most common)
+  for (fld in c("crossvalid", "rmse", "crossentropy", "cv", "ce")) {
+    if (!is.null(elem[[fld]])) {
+      v <- suppressWarnings(as.numeric(elem[[fld]]))
+      v <- v[is.finite(v)]
+      if (length(v) > 0) return(mean(v, na.rm = TRUE))
+    }
+  }
+  
+  # Nested under $tess3 (some wrapper versions)
+  if (!is.null(elem$tess3)) {
+    inner <- pull_cv_value(elem$tess3)
+    if (!is.na(inner)) return(inner)
+  }
+  
+  # List-of-replicates: each replicate is itself a list with $crossvalid
+  if (is.list(elem) && length(elem) > 0) {
+    rep_vals <- vapply(elem, function(r) {
+      if (is.list(r)) {
+        for (fld in c("crossvalid", "rmse", "crossentropy", "cv", "ce")) {
+          if (!is.null(r[[fld]])) {
+            v <- suppressWarnings(as.numeric(r[[fld]]))
+            v <- v[is.finite(v)]
+            if (length(v) > 0) return(mean(v, na.rm = TRUE))
+          }
+        }
+      }
+      NA_real_
+    }, numeric(1))
+    rep_vals <- rep_vals[is.finite(rep_vals)]
+    if (length(rep_vals) > 0) return(mean(rep_vals, na.rm = TRUE))
+  }
+  
+  return(NA_real_)
+}
+
+# Helper: locate the per-K element under common indexing schemes
+locate_k_element <- function(obj, i, k) {
+  candidates <- list(
+    obj[[k]],
+    obj[[paste0("K", k)]],
+    obj[[paste0("K=", k)]],
+    obj[[paste0("k", k)]],
+    obj[[paste0("k=", k)]],
+    obj[[i]],
+    if (!is.null(obj$results))    obj$results[[i]]    else NULL,
+    if (!is.null(obj$results))    obj$results[[k]]    else NULL,
+    if (!is.null(obj$tess3))      obj$tess3[[i]]      else NULL,
+    if (!is.null(obj$tess3))      obj$tess3[[k]]      else NULL,
+    if (!is.null(obj$Qmatrix))    obj$Qmatrix[[i]]    else NULL,
+    if (!is.null(obj$models))     obj$models[[i]]     else NULL,
+    if (!is.null(obj$models))     obj$models[[k]]     else NULL
+  )
+  for (c in candidates) {
+    if (!is.null(c)) return(c)
+  }
+  NULL
+}
+
+extract_cv <- function(obj, k_values) {
+  # Case 1: top-level flat vector matching K_VALUES
+  for (fld in c("crossvalid", "rmse", "crossentropy", "cv", "ce")) {
+    if (!is.null(obj[[fld]])) {
+      v <- suppressWarnings(as.numeric(obj[[fld]]))
+      if (length(v) == length(k_values) && any(is.finite(v))) {
+        return(v)
+      }
+    }
+  }
+  
+  # Case 2: top-level $tess3 holds the flat vector (wrapper variants)
+  if (!is.null(obj$tess3)) {
+    for (fld in c("crossvalid", "rmse", "crossentropy", "cv", "ce")) {
+      if (!is.null(obj$tess3[[fld]])) {
+        v <- suppressWarnings(as.numeric(obj$tess3[[fld]]))
+        if (length(v) == length(k_values) && any(is.finite(v))) {
+          return(v)
+        }
+      }
+    }
+  }
+  
+  # Case 3: per-K list structure (most common for tess3() output)
+  cv_per_k <- vapply(seq_along(k_values), function(i) {
+    elem <- locate_k_element(obj, i, k_values[i])
+    pull_cv_value(elem)
+  }, numeric(1))
+  
+  return(cv_per_k)
+}
+
+cv_scores <- extract_cv(tess3_obj, K_VALUES)
+
+# Diagnostic if extraction failed entirely
+if (length(cv_scores) == 0 || all(is.na(cv_scores))) {
+  cat("\nWARNING: Could not extract CV scores automatically.\n")
+  cat("Inspect tess3_obj structure with:\n")
+  cat("  str(tess3_obj, max.level = 2)\n")
+  cat("  names(tess3_obj)\n")
+  cat("  if (is.list(tess3_obj) && length(tess3_obj) > 0) names(tess3_obj[[1]])\n")
+  cat("  class(tess3_obj)\n\n")
+  cat("If you ran tess3Main() directly, CV is NOT computed automatically.\n")
+  cat("Re-run with tess3() and rep > 1 plus a non-zero mask proportion.\n\n")
+  stop("CV scores not found in tess3_obj; cannot build cv_table.")
+}
+
+# Warn on partial extraction (some K worked, others NA)
+if (any(is.na(cv_scores))) {
+  cat("\nWARNING: CV score is NA for K =",
+      paste(K_VALUES[is.na(cv_scores)], collapse = ", "),
+      "\nProceeding with available values; check tess3_obj structure for those K.\n\n")
 }
 
 # Create CV results table
@@ -395,9 +508,23 @@ cv_table <- data.frame(
 kable(cv_table, digits = 4, caption = "Cross-Validation Scores") %>%
   kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
 
-# Determine optimal K (minimum CV score)
+# Determine optimal K (minimum CV score), ignoring NAs
 optimal_K <- K_VALUES[which.min(cv_scores)]
 cat("\nOptimal K (minimum CV):", optimal_K, "\n")
+
+# Elbow K via largest second-difference (curvature) on the CV curve.
+# Favors the "knee" where marginal improvement drops off, which for
+# spatial models like TESS3 is usually a more defensible K than the global min.
+cv_finite <- cv_scores
+if (sum(is.finite(cv_finite)) >= 3) {
+  d2 <- diff(diff(cv_finite))
+  # d2 indexes correspond to interior K values: K_VALUES[2:(length-1)]
+  if (any(is.finite(d2))) {
+    elbow_idx <- which.max(d2) + 1L  # +1 to map back to K_VALUES index
+    elbow_K <- K_VALUES[elbow_idx]
+    cat("Elbow K (max curvature):", elbow_K, "\n")
+  }
+}
 ```
 
 ## Plot Cross-Validation Scores
@@ -410,12 +537,34 @@ plot(K_VALUES, cv_scores,
      ylab = "Cross-Validation Score",
      main = "TESS3 Cross-Validation Scores")
 
-# Mark optimal K
+# Mark optimal K (minimum CV)
 points(optimal_K, cv_scores[which.min(cv_scores)], 
        pch = 19, col = "red", cex = 2)
 text(optimal_K, cv_scores[which.min(cv_scores)], 
      paste("Optimal K =", optimal_K), 
      pos = 3, col = "red", font = 2)
+
+# Mark elbow K (max curvature), if it was computed and differs from optimal
+if (exists("elbow_K") && !is.na(elbow_K)) {
+  elbow_y <- cv_scores[K_VALUES == elbow_K]
+  points(elbow_K, elbow_y,
+         pch = 19, col = "darkgreen", cex = 2)
+  # Offset label below if elbow == optimal to avoid overlap
+  label_pos <- if (elbow_K == optimal_K) 1 else 3
+  text(elbow_K, elbow_y,
+       paste("Elbow K =", elbow_K),
+       pos = label_pos, col = "darkgreen", font = 2)
+}
+
+# Legend
+legend("topright",
+       legend = c("CV score", "Optimal K (min CV)", "Elbow K (max curvature)"),
+       col    = c("blue",     "red",                "darkgreen"),
+       pch    = c(19,         19,                   19),
+       lty    = c(1,          NA,                   NA),
+       pt.cex = c(1,          2,                    2),
+       bty    = "n")
+
 grid()
 ```
 
@@ -426,8 +575,8 @@ grid()
 ```{r structure-barplots, fig.width=14, fig.height=18}
 # Define color palette
 my.colors <- c("tomato", "orange", "purple", "olivedrab", "gold", 
-               "lightblue", "grey", "pink", "brown")
-my.palette <- CreatePalette(my.colors, 9)
+               "lightblue", "grey", "pink", "brown","blue")
+my.palette <- CreatePalette(my.colors, 10)
 
 # Set up multi-panel plot
 par(mfrow = c(3, 2), mar = c(4, 4, 3, 1))
@@ -488,7 +637,7 @@ for (K in K_VALUES[K_VALUES > 1]) {
 
 ```{r spatial-maps-base, fig.width=12, fig.height=16}
 # Set up multi-panel plot
-par(mfrow = c(3, 2), mar = c(4, 4, 3, 2))
+par(mfrow = c(5, 2), mar = c(4, 4, 3, 2))
 
 # Plot for each K value (skip K=1)
 for (K in K_VALUES[K_VALUES > 1]) {
@@ -529,13 +678,40 @@ lat_buffer <- diff(lat_range) * 0.2
 xlim_map <- c(lon_range[1] - lon_buffer, lon_range[2] + lon_buffer)
 ylim_map <- c(lat_range[1] - lat_buffer, lat_range[2] + lat_buffer)
 
+# Build a reusable palette generator. CreatePalette() from tess3r returns
+# a list of color ramps (one per ancestral cluster). If tess3r's helper
+# is unavailable for any reason, fall back to a manual ramp list.
+make_palette <- function(K) {
+  base_cols <- c("tomato", "orange", "lightyellow", "wheat", "olivedrab",
+                 "lightgreen", "skyblue2", "steelblue", "violet",
+                 "purple", "pink2", "gray70")
+  base_cols <- rep_len(base_cols, K)  # recycle if K > length(base_cols)
+  
+  # Preferred path: tess3r's CreatePalette
+  pal <- tryCatch(
+    tess3r::CreatePalette(base_cols, palette.length = 9),
+    error = function(e) NULL
+  )
+  if (!is.null(pal)) return(pal)
+  
+  # Fallback: build a list of color ramps manually
+  lapply(base_cols, function(col) {
+    colorRampPalette(c("white", col))(9)
+  })
+}
+
 # Create plots for each K
 for (K in K_VALUES[K_VALUES > 1]) {
   # Extract Q-matrix
   q.matrix <- qmatrix(tess3_obj, K = K)
   
-  # Create map using ggtess3Q
-  pl <- ggtess3Q(q.matrix, coord_matrix, map.polygon = map.polygon)
+  # Build palette sized to this K
+  my_palette <- make_palette(K)
+  
+  # Create map using ggtess3Q with explicit palette
+  pl <- ggtess3Q(q.matrix, coord_matrix,
+                 map.polygon = map.polygon,
+                 col.palette = my_palette)
   
   # Customize plot
   p <- pl +
