@@ -1,232 +1,165 @@
-# Köppen-Geiger Climate Change Analysis
+# Köppen-Geiger Future Climate Analysis
 
-This R script calculates changes in Köppen-Geiger climate classifications between two time periods (1991-2020 to 2041-2070 under SSP585) for sample locations provided in a CSV file.
+This directory contains specialized tools for analyzing how Köppen-Geiger climate classifications are projected to shift under future climate scenarios, providing ecological context for genetic offset assessments.
 
-## Requirements
+## Overview
 
-### R Packages
-```r
-install.packages(c("terra", "dplyr", "tidyr", "ggplot2", "readr", "viridis"))
-```
+The Köppen-Geiger climate classification system provides an intuitive ecological framework for understanding how environments may change. This workflow analyzes shifts in climate classifications under future scenarios to complement genetic offset analyses with ecological interpretation.
 
-### Data Files
+## Contents
 
-**1. Köppen-Geiger Raster Data**
-- Download from: https://figshare.com/articles/dataset/21789074
-- File: `koppen_geiger_tif.zip` (125 MB)
-- Extract the zip file to your working directory
-- Reference: Beck et al. (2023) Scientific Data 10, 724
+### Documentation
 
-**2. Your Sample Data CSV**
-- Must contain at minimum: longitude, latitude, and population columns
-- See `sample_input_template.csv` for format example
+- **README.md** - Overview of Köppen-Geiger classification system and analysis approach (this file)
 
-## Input CSV Format
+- **VISUALIZATION_GUIDE.md** - Comprehensive guide for:
+  - Creating climate classification maps
+  - Visualizing classification shifts
+  - Generating publication-quality figures
+  - Color schemes and aesthetic choices
+  - Interpretation of visual patterns
 
-Your CSV file should have the following structure:
+### Analysis Scripts
 
-```csv
-sample_id,longitude,latitude,population
-Sample001,-122.4194,37.7749,Pop1
-Sample002,-118.2437,34.0522,Pop1
-Sample003,-87.6298,41.8781,Pop2
-...
-```
+- **koppen_geiger_climate_change_analysis.R** - R script for:
+  - Assigning Köppen-Geiger classifications
+  - Comparing current vs. future classifications
+  - Identifying climate shifts
+  - Calculating areas of classification change
+  - Visualizing climate scenario comparisons
+  - Generating summary statistics
 
-### Required Columns:
-- **longitude**: Decimal degrees (-180 to 180)
-- **latitude**: Decimal degrees (-90 to 90)
-- **population**: Grouping variable (can be population, site, region, etc.)
+## Key Features
 
-### Optional Columns:
-- **sample_id**: Unique identifier for each sample (will be auto-generated if not provided)
-- Any other columns in your CSV will be preserved in the output
+- Classification assignment based on bioclimatic variables
+- Temporal comparison (current vs. future scenarios)
+- Area-based analysis of climate shifts
+- Multi-scenario support and comparison
+- Publication-ready visualization functions
+- Quantitative summary metrics
 
-## Configuration
+## Köppen-Geiger System Overview
 
-Edit these variables at the top of `koppen_geiger_climate_change_analysis.R`:
+The Köppen-Geiger classification uses:
+- **Temperature** (annual, seasonal)
+- **Precipitation** (annual, seasonal)
+- Combines into hierarchical categories:
+  - **Tropical** (A) - Hot climates
+  - **Dry** (B) - Arid and semi-arid
+  - **Temperate** (C) - Warm and cool temperate
+  - **Continental** (D) - Cold with winter snow
+  - **Polar** (E) - Extremely cold
 
-```r
-# 1. Path to your input CSV file
-input_csv <- "your_samples.csv"
+## Workflow Steps
 
-# 2. Column names (adjust to match your CSV)
-lon_column <- "longitude"
-lat_column <- "latitude"
-population_column <- "population"
-id_column <- "sample_id"  # Set to NULL if you don't have this column
+1. Obtain current and projected bioclimatic variables
+2. Calculate Köppen-Geiger classifications
+3. Compare current vs. future classifications
+4. Identify areas of climate change
+5. Quantify classification shifts by type
+6. Analyze geographic patterns
+7. Visualize changes and create maps
+8. Generate summary reports
 
-# 3. Paths to Köppen-Geiger rasters
-kg_historical_path <- "koppen_geiger/1991_2020/koppen_geiger_0p00833333.tif"
-kg_future_path <- "koppen_geiger/2041_2070/ssp585/koppen_geiger_0p00833333.tif"
+## Input Requirements
 
-# 4. Output file prefix
-output_prefix <- "koppen_geiger_analysis"
-```
+- Bioclimatic variables for current period
+- Bioclimatic variables for future climate scenarios
+- Climate projections (WORLDCLIM, downscaled GCMs, etc.)
+- Geographic coordinate system information
+- Raster or point-based environmental data
 
-## Usage
+## Output
 
-1. **Prepare your data:**
-   - Create a CSV file with your sample locations
-   - Ensure it has longitude, latitude, and population columns
+Results include:
+- Köppen-Geiger classification maps (current and future)
+- Climate change classification maps
+- Statistical summaries of classification shifts
+- Area affected by climate changes
+- Transition matrices showing classification changes
+- Publication-quality visualizations
 
-2. **Download Köppen-Geiger data:**
-   ```bash
-   # Download koppen_geiger_tif.zip from Figshare
-   # Extract it to your working directory
-   ```
+## Interpreting Climate Shifts
 
-3. **Configure the script:**
-   - Edit the configuration section with your file paths and column names
+### Types of Changes
+- **Within-type variation** - Changes within category (e.g., wetter savanna to drier forest)
+- **Category changes** - Shifts between major classes (e.g., temperate to continental)
+- **Zone expansion** - Poleward or altitudinal shift of climate boundaries
+- **Range contraction** - Loss of suitable climate space
 
-4. **Run the analysis:**
-   ```r
-   source("koppen_geiger_climate_change_analysis.R")
-   ```
+### Ecological Implications
 
-## Outputs
+**Tropical to Dry**: 
+- Decreased precipitation
+- Potential for desertification
+- Shift from forest to savanna ecosystems
 
-The script produces multiple output files:
+**Temperate to Continental**:
+- More extreme winters
+- Greater seasonal variation
+- Different frost and freeze patterns
 
-### CSV Files:
-1. **`*_full_results.csv`** - Complete dataset with all original columns plus:
-   - `kg_historical_code` - Historical Köppen-Geiger numeric code
-   - `kg_historical_class` - Historical climate class (e.g., "Cfa")
-   - `kg_historical_description` - Human-readable description
-   - `kg_historical_major` - Major climate class (A/B/C/D/E)
-   - `kg_future_code` - Future Köppen-Geiger numeric code
-   - `kg_future_class` - Future climate class
-   - `kg_future_description` - Future description
-   - `kg_future_major` - Future major class
-   - `climate_changed` - Boolean: did climate class change?
-   - `major_class_changed` - Boolean: did major class change?
-   - `change_type` - Description of transition (e.g., "Cfa → Csa")
-   - `major_change_type` - Major class transition
+**Dry to Temperate**:
+- Increased precipitation and moisture
+- Potential for vegetation expansion
+- Greening and biomass increases
 
-2. **`*_population_summary.csv`** - Summary statistics by population
-   - Number of samples per population
-   - Number and percentage that changed climate class
-   - Number and percentage that changed major class
+## Applications
 
-3. **`*_change_details.csv`** - Detailed breakdown of climate transitions by population
+### Conservation Biology
+- Identify refugial climate space
+- Plan species range shift corridors
+- Assess habitat suitability changes
 
-4. **`*_major_class_summary.csv`** - Summary of major climate class changes
+### Agriculture
+- Determine crop suitability shifts
+- Plan regional adaptation strategies
+- Identify emerging growing zones
 
-5. **`*_overall_summary.csv`** - Overall statistics across all samples
+### Biodiversity Planning
+- Assess ecosystem stability
+- Identify high-priority conservation areas
+- Plan for climate-responsive management
 
-6. **`*_top_transitions.csv`** - Most common climate transitions
+### Complementing Genetic Offset
 
-### Plots (PNG, 300 DPI):
+This analysis provides:
+- **Ecological context** for genetic offset scores
+- **Climate analog** identification (finding current conditions like future climates)
+- **Population-level interpretation** of offset in ecological terms
+- **Cross-validation** of offset predictions
 
-**Spatial Maps (4 maps):**
-1. **`*_map_A_historical.png`** - Historical climate map (1991-2020) with sample points overlaid
-2. **`*_map_B_future.png`** - Future climate map (2041-2070, SSP585) with sample points overlaid
-3. **`*_map_change.png`** - Climate change map showing areas that changed (red) vs unchanged (gray)
-4. **`*_map_AB_combined.png`** - Side-by-side comparison of historical and future climate (A/B figure)
+## Visualization Guidelines
 
-**Statistical Plots (8-9 plots):**
-5. **`*_by_population.png`** - Bar chart showing percentage of samples with climate change by population
-6. **`*_stacked_bar.png`** - Stacked bar chart showing changed vs unchanged samples per population
-7. **`*_top_transitions.png`** - Top 15 most common climate class transitions (major classes)
-8. **`*_major_classes.png`** - Major climate class changes (A/B/C/D/E) by population
-9. **`*_minor_transitions_top20.png`** - Top 20 detailed minor climate class transitions (e.g., Cfa → Csa)
-10. **`*_minor_transitions_by_pop.png`** - Top 5 minor climate transitions for each population (faceted)
-11. **`*_transition_heatmap.png`** - Transition matrix heatmap showing all historical → future class changes (only created if ≤15 unique classes)
-12. **`*_class_distribution.png`** - Side-by-side comparison of climate class distribution in historical vs future periods
-13. **`*_transition_flow.png`** - Stacked bar chart showing where the top 8 historical climate classes transition to
+See **VISUALIZATION_GUIDE.md** for:
+- Color scheme recommendations
+- Map projection choices
+- Effective figure layouts
+- Adding geographic context
+- Creating publication figures
+- Interpretation aids and legends
 
-**Total: 6 CSV files + 12-13 plots (depending on class diversity)**
+## Limitations and Considerations
 
-## Köppen-Geiger Classification
+- Köppen-Geiger is discrete classification (hides gradual changes)
+- Sensitive to bioclimatic variable thresholds
+- Does not capture within-classification variation
+- Climate projections have inherent uncertainty
+- Ecological changes may lag climate changes
 
-### Major Climate Classes:
-- **A** - Tropical
-- **B** - Arid
-- **C** - Temperate
-- **D** - Cold
-- **E** - Polar
+## Integration with Genetic Analysis
 
-### Sub-classes (examples):
-- **Af** - Tropical rainforest
-- **Aw** - Tropical savannah
-- **BSk** - Arid steppe, cold
-- **Cfa** - Temperate, no dry season, hot summer
-- **Dfb** - Cold, no dry season, warm summer
-- **ET** - Polar tundra
+Use climate classification shifts alongside genetic offset to:
+- Validate offset predictions with ecological interpretation
+- Identify populations in novel future climates (no current analog)
+- Assess whether genetic adaptation matches ecological expectations
+- Communicate findings to non-specialist audiences
+- Develop management and policy recommendations
 
-See `kg_legend` in the script for complete classification system.
+## Related Sections
 
-## Time Periods
-
-- **Historical**: 1991-2020 (baseline, observational data)
-- **Future**: 2041-2070 under SSP5-8.5 scenario
-
-**Note:** The original request was for 1991-2000, but the Beck et al. (2023) dataset's closest baseline period is 1991-2020. This is actually better as it provides a more robust 30-year climatological baseline.
-
-## Example Workflow
-
-```r
-# 1. Set working directory
-setwd("/path/to/your/project")
-
-# 2. Load packages (install if needed)
-library(terra)
-library(dplyr)
-library(tidyr)
-library(ggplot2)
-library(readr)
-
-# 3. Run the analysis
-source("koppen_geiger_climate_change_analysis.R")
-```
-
-## Troubleshooting
-
-### Error: "Input CSV file not found"
-- Check that `input_csv` path is correct
-- Use absolute path if relative path doesn't work
-
-### Error: "Missing required columns in CSV"
-- Verify your CSV has the columns specified in the configuration
-- Check for typos in column names (case-sensitive!)
-
-### Error: "Köppen-Geiger raster not found"
-- Ensure you've downloaded and extracted `koppen_geiger_tif.zip`
-- Check that paths in configuration match your directory structure
-
-### Warning: "Longitude/latitude values outside valid range"
-- Check your coordinate data for errors
-- Ensure longitude is -180 to 180, latitude is -90 to 90
-
-### Warning: "Missing coordinates"
-- Some rows have NA values in longitude or latitude
-- These rows will be automatically removed from analysis
-
-## Citation
-
-If you use this analysis in publications, please cite:
-
-Beck, H.E., T.R. McVicar, N. Vergopolan, A. Berg, N.J. Lutsko, A. Dufour, Z. Zeng, X. Jiang, A.I.J.M. van Dijk, D.G. Miralles (2023). High-resolution (1 km) Köppen-Geiger maps for 1901–2099 based on constrained CMIP6 projections. Scientific Data 10, 724. https://doi.org/10.1038/s41597-023-02549-6
-
-## Additional Notes
-
-- The script preserves all original columns from your input CSV
-- Missing coordinate values are automatically removed with a warning
-- The script validates input data and provides helpful error messages
-- All plots are saved as high-resolution PNG files (300 DPI)
-- Results are sorted by percentage of climate change for easy interpretation
-
-## Support
-
-For questions about:
-- **Köppen-Geiger data**: See Beck et al. (2023) documentation
-- **This script**: Check the inline comments in the R script
-- **Your specific data**: Validate your CSV format matches the template
-
-## Version History
-
-- v1.0 (2025-01-25): Initial release
-  - CSV input support
-  - Multiple output formats
-  - Comprehensive visualizations
-  - Detailed documentation
+See also:
+- [Genetic Offset Analysis](../README.md) - Main genetic offset workflow
+- [Accessing Climate and Soil Data](../../Accessing%20Climate%20and%20Soil%20Data/README.md) - Obtain bioclimatic data
+- [Mapping Accessions](../../Mapping%20Accessions/README.md) - Geographic visualization
+- [Environmental Genomic Selection](../../Environmental%20Genomic%20Selection/README.md) - Adaptation planning
